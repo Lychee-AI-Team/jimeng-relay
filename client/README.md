@@ -240,6 +240,92 @@ jimeng video submit \
   --format json
 ```
 
+### 6.4 视频生成命令速查表
+
+#### 文生视频 (Text-to-Video)
+
+```bash
+# 720p
+jimeng video submit --preset t2v-720 --prompt "一只可爱的猫咪在草地上奔跑" --wait --download-dir outputs/
+
+# 1080p
+jimeng video submit --preset t2v-1080 --prompt "一只可爱的猫咪在草地上奔跑" --wait --download-dir outputs/
+
+# Pro
+jimeng video submit --preset t2v-pro --prompt "一只可爱的猫咪在草地上奔跑" --wait --download-dir outputs/
+```
+
+#### 图生视频 - 首帧 (Image-to-Video First Frame)
+
+**使用本地文件 (1 张图片):**
+```bash
+# 720p
+jimeng video submit --preset i2v-first-720 --prompt "猫咪向前奔跑" --image-file outputs/first.png --wait --download-dir outputs/
+
+# 1080p
+jimeng video submit --preset i2v-first --prompt "猫咪向前奔跑" --image-file outputs/first.png --wait --download-dir outputs/
+
+# Pro
+jimeng video submit --preset i2v-first-pro --prompt "猫咪向前奔跑" --image-file outputs/first.png --wait --download-dir outputs/
+```
+
+**使用 URL (1 张图片):**
+```bash
+jimeng video submit --preset i2v-first-720 --prompt "猫咪向前奔跑" --image-url "https://example.com/first.png" --wait --download-dir outputs/
+```
+
+#### 图生视频 - 首尾帧 (Image-to-Video First + Tail Frame)
+
+**使用本地文件 (2 张图片):**
+```bash
+# 720p
+jimeng video submit --preset i2v-first-tail-720 --prompt "从首帧过渡到尾帧" \
+  --image-file outputs/first.png --image-file outputs/tail.png \
+  --wait --download-dir outputs/
+
+# 1080p
+jimeng video submit --preset i2v-first-tail --prompt "从首帧过渡到尾帧" \
+  --image-file outputs/first.png --image-file outputs/tail.png \
+  --wait --download-dir outputs/
+```
+
+**使用 URL (2 张图片，重复参数):**
+```bash
+jimeng video submit --preset i2v-first-tail --prompt "从首帧过渡到尾帧" \
+  --image-url "https://example.com/first.png" \
+  --image-url "https://example.com/tail.png" \
+  --wait --download-dir outputs/
+```
+
+**使用 URL (2 张图片，逗号分隔):**
+```bash
+jimeng video submit --preset i2v-first-tail --prompt "从首帧过渡到尾帧" \
+  --image-url "https://example.com/first.png,https://example.com/tail.png" \
+  --wait --download-dir outputs/
+```
+
+#### 图生视频 - 运镜 (Image-to-Video Recamera)
+
+```bash
+jimeng video submit --preset i2v-recamera --prompt "镜头向前推进" \
+  --image-file outputs/first.png \
+  --template horizontal_pan_left \
+  --camera-strength strong \
+  --wait --download-dir outputs/
+```
+
+#### 图片数量要求
+
+| 预设类型 | 图片数量 | 参数示例 |
+|:---|:---:|:---|
+| `t2v-*` | 0 | 不需要 `--image-url` 或 `--image-file` |
+| `i2v-first-*` | 1 | `--image-file first.png` |
+| `i2v-first-tail-*` | 2 | `--image-file first.png --image-file tail.png` |
+| `i2v-recamera` | 1 | `--image-file first.png` |
+
+> **注意**: `--image-url` 和 `--image-file` 互斥，不能同时使用。
+
+### 6.5 一步式提交 + 等待 + 下载
 ### 6.4 一步式提交 + 等待 + 下载
 
 ```bash
