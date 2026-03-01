@@ -49,8 +49,8 @@
 ### 🎯 能力边界
 
 **支持**
-- 文生图 (Text-to-Image) / 文生视频 (Text-to-Video)
-- 图生图 (Image-to-Image) / 图生视频 (Image-to-Video)
+- 文生图 (Text-to-Image) / 文生视频 (Video 3.0)
+- 图生图 (Image-to-Image) / 图生视频 (Video 3.0)
 - 图生图 (Image-to-Image，支持 URL 和本地文件)
 - 异步任务提交与结果查询
 

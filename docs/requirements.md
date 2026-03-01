@@ -29,7 +29,7 @@
 
 ### 1.1 项目背景
 
-即梦 4.0 API中转服务（Jimeng Relay）是一个高性能的API网关服务，位于客户端与火山引擎即梦4.0 API之间，提供：
+即梦 4.0 图片 / 3.0 视频 API中转服务（Jimeng Relay）是一个高性能的API网关服务，位于客户端与火山引擎即梦 4.0 图片 / 3.0 视频 API之间，提供：
 
 - **统一鉴权**：AWS SigV4签名算法验证客户端身份
 - **审计追踪**：记录所有请求和响应的完整生命周期
@@ -65,10 +65,10 @@
 ### 1.4 能力边界
 
 #### 已支持
-- 即梦4.0异步任务提交 (`CVSync2AsyncSubmitTask`)
-- 即梦4.0结果查询 (`CVSync2AsyncGetResult`)
-- 文生图 (t2i) / 文生视频 (t2v)
-- 图生图 (i2i) / 图生视频 (i2v)
+- 即梦 4.0 图片 / 3.0 视频 异步任务提交 (`CVSync2AsyncSubmitTask`)
+- 即梦 4.0 图片 / 3.0 视频 结果查询 (`CVSync2AsyncGetResult`)
+- 文生图 (t2i) / 文生视频 (t2v, Video 3.0)
+- 图生图 (i2i) / 图生视频 (i2v, Video 3.0)
 - 图生图 (i2i，URL和本地文件)
 
 #### 不支持
@@ -228,7 +228,7 @@ server/
 | `UPSTREAM_MAX_QUEUE` | 否 | `100` | 排队队列大小 |
 | `UPSTREAM_SUBMIT_MIN_INTERVAL` | 否 | `0s` | Submit最小间隔 |
 | `PER_KEY_MAX_CONCURRENT` | 否 | `1` | 每Key最大并发 |
-| `PER_KEY_MAX_QUEUE` | 否 | `1` | 每Key排队大小 |
+| `PER_KEY_MAX_QUEUE` | 否 | `0` | 每Key排队大小 (固定为0) |
 
 #### 配置加载优先级
 
@@ -258,7 +258,7 @@ srv := &http.Server{
 | 上游响应体 | 8MB | 防止OOM |
 | Retry-After延迟 | 60s | 防止过度等待 |
 | 请求体 | 通过`http.MaxBytesReader`限制 | 防止大请求攻击 |
-
+| 请求体限制 | 20MiB | 防止大请求攻击 |
 ---
 
 ## 4. 客户端技术规范
@@ -468,6 +468,13 @@ func (c *Cipher) Decrypt(ciphertext string) (string, error) {
 }
 ```
 
+#### 5.3.1 密钥验证要求
+
+`API_KEY_ENCRYPTION_KEY` 必须满足以下条件：
+- 必须是 Base64 编码字符串
+- 解码后必须正好是 32 字节 (256位)
+
+
 ### 5.4 Fail-Closed审计策略
 
 ```go
@@ -487,7 +494,11 @@ if err := h.audit.RecordRelayDownstream(ctx, call); err != nil {
 | Secret Key | 完全隐藏 `***` |
 | 请求体 | 不记录敏感字段 |
 
----
+#### 5.5.1 安全警告
+
+- **.env 加载风险**: 在可写运行时目录中加载 `.env` 文件存在被恶意篡改或泄露的风险。生产环境建议使用系统环境变量。
+- **VOLC_HOST 覆盖风险**: 覆盖 `VOLC_HOST` 可能导致凭证暴露给非预期的中间节点。除非在受控的测试/代理环境下，否则不建议修改。
+
 
 ## 6. 并发控制
 
@@ -830,7 +841,8 @@ VOLC_ACCESSKEY=<生产AK>
 VOLC_SECRETKEY=<生产SK>
 API_KEY_ENCRYPTION_KEY=<安全生成的32字节密钥>
 DATABASE_TYPE=postgres
-DATABASE_URL=postgres://user:password@host:5432/dbname?sslmode=require
+DATABASE_URL=postgres://user:password@host:5432/dbname?sslmode=require # 生产环境推荐使用 PostgreSQL，避免 SQLite 的并发限制
+# 建议使用绝对路径配置 DATABASE_URL
 SERVER_PORT=8080
 UPSTREAM_MAX_CONCURRENT=3
 UPSTREAM_MAX_QUEUE=100

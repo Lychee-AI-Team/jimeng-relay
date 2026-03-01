@@ -1,6 +1,6 @@
 # Jimeng CLI Client
 
-`jimeng` 是即梦 AI 图片/视频生成 4.0 的 Go 命令行客户端，支持：
+`jimeng` 是即梦 AI 图片 4.0 / 视频 3.0 的 Go 命令行客户端，支持：
 
 - 文生图（t2i）/ 文生视频（t2v）
 - 图生图（i2i）/ 图生视频（i2v）
