@@ -8,6 +8,12 @@ Jimeng Relay Server 是一个高性能的即梦 4.0 API 中继服务，旨在为
 - **鉴权机制**：采用 AWS SigV4 签名算法进行客户端鉴权。
 - **审计与监控**：记录所有下游请求与上游尝试，包含延迟、状态码及错误分类。
 - **幂等性**：针对 `submit` 接口提供基于 `Idempotency-Key` 的幂等支持。
+- **计费治理**：支持基于预设（Preset）的计费公式、预授权（Pre-Auth）与结算（Settle）机制。
+- **管理端 API**：提供管理员引导、登录、API Key 管理、定价及预算设置等 HTTP 接口。
+- **安全设计**：敏感字段（如 API Key Secret）在数据库中加密存储，审计失败采取 Fail-Closed 策略。
+- **鉴权机制**：采用 AWS SigV4 签名算法进行客户端鉴权。
+- **审计与监控**：记录所有下游请求与上游尝试，包含延迟、状态码及错误分类。
+- **幂等性**：针对 `submit` 接口提供基于 `Idempotency-Key` 的幂等支持。
 - **安全设计**：敏感字段（如 API Key Secret）在数据库中加密存储，审计失败采取 Fail-Closed 策略。
 
 ## 配置说明
@@ -180,6 +186,62 @@ railway ssh -- ./jimeng-server key create --description "prod-client" --expires-
 ```
 
 > **重要**：请保存 `access_key` 和 `secret_key`，客户端需要使用它们进行 AWS SigV4 签名认证。
+## 管理端 API (Admin API)
+
+服务端提供了一套基于 Session Cookie 的管理端 API，用于管理员引导、登录及资源治理。所有管理端接口均以 `/admin` 开头。
+
+### 1. 身份管理 (Auth)
+
+| 功能 | 路径 | 方法 | 说明 |
+| :--- | :--- | :--- | :--- |
+| 管理员引导 | `/admin/bootstrap` | `POST` | 创建首个管理员账号（仅在无管理员时可用） |
+| 登录 | `/admin/login` | `POST` | 验证邮箱密码并下发 `admin_session` Cookie |
+| 登出 | `/admin/logout` | `POST` | 销毁当前 Session |
+| 重置请求 | `/admin/reset-request` | `POST` | 发送密码重置邮件 |
+| 重置密码 | `/admin/reset` | `POST` | 使用邮件中的 Token 重置密码 |
+
+### 2. 资源治理 (Governance)
+
+> **注意**：除 `bootstrap`、`login`、`reset-request` 和 `reset` 外，其余接口均需管理员登录。
+
+| 功能 | 路径 | 方法 | 说明 |
+| :--- | :--- | :--- | :--- |
+| 创建 Key | `/admin/keys` | `POST` | 创建新的 API Key（返回 AK/SK） |
+| 设置定价 | `/admin/pricing` | `POST` | 设置预设（Preset）的图片/视频单价 |
+| 设置预算 | `/admin/budget` | `POST` | 设置特定 API Key 的可用额度 |
+| 设置倍率 | `/admin/multiplier` | `POST` | 设置特定 API Key 的计费倍率（10000 = 1.0x） |
+
+## 计费模型与定价 (Billing & Pricing)
+
+### 1. 计费公式 (Pricing Formula)
+
+服务端根据请求类型和预设单价计算预估成本：
+
+- **图片生成**：`preset.image_cost * multiplier / 10000`
+- **视频生成**：`preset.video_cost_per_second * duration_seconds * multiplier / 10000`
+
+其中 `multiplier` 为整数，`10000` 代表 `1.0x`。例如，倍率为 `12000` 则代表 `1.2x`。
+
+### 2. 计费流程 (Billing Lifecycle)
+
+1. **预授权 (Pre-Auth)**：在 `submit` 阶段，根据预估成本从 API Key 的可用额度中扣除并转入“已预留（Reserved）”状态。如果余额不足，请求将返回 `400 Insufficient Budget`。
+2. **结算 (Settle)**：当上游任务成功完成时，预留额度正式转为已消耗，并从总额度中扣除。
+3. **释放 (Release)**：如果任务提交失败或上游返回错误，预留额度将原路退回至可用额度。
+
+## 视频帧率规则 (Video Frames Rule)
+
+视频生成的时长由 `frames` 参数决定，遵循以下规则：
+
+- **公式**：`24 * n + 1` (n 为秒数)
+- **允许范围**：`[121, 241]` (即 5s 或 10s)
+- **默认值**：`121` (5s)
+- **校验**：不符合公式或超出范围的 `frames` 将导致 `400 Validation Failed`。
+
+## 兼容性声明 (Compatibility)
+
+- **CLI 兼容**：原有的 `./jimeng-server key` 命令行工具依然保留，可继续用于 API Key 的生命周期管理。
+- **客户端兼容**：Relay Server 的核心 API (`/v1/submit`, `/v1/get-result`) 保持不变，客户端无需修改签名逻辑或请求构造。
+- **数据库迁移**：服务启动时会自动执行数据库迁移，以支持新的计费和管理表结构。
 ## 线上部署 (PostgreSQL)
 
 1. **数据库准备**：准备一个 PostgreSQL 实例。
