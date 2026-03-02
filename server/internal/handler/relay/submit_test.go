@@ -19,6 +19,7 @@ import (
 	"github.com/jimeng-relay/server/internal/relay/upstream"
 	"github.com/jimeng-relay/server/internal/repository"
 	auditservice "github.com/jimeng-relay/server/internal/service/audit"
+	billingservice "github.com/jimeng-relay/server/internal/service/billing"
 	idempotencyservice "github.com/jimeng-relay/server/internal/service/idempotency"
 )
 
@@ -132,7 +133,7 @@ func newTestAuditService(t *testing.T, dsErr, usErr, aeErr error) (*auditservice
 	ds := &recordingDownstreamRepo{err: dsErr}
 	us := &recordingUpstreamRepo{err: usErr}
 	ae := &recordingAuditRepo{err: aeErr}
-	rnd := bytes.NewReader(bytes.Repeat([]byte{0x01}, 24))
+	rnd := bytes.NewReader(bytes.Repeat([]byte{0x01}, 4096))
 	svc := auditservice.NewService(ds, us, ae, auditservice.Config{Now: func() time.Time { return base }, Random: rnd})
 	return svc, ds, us, ae
 }
@@ -155,6 +156,21 @@ func (f *fakeSubmitClient) Submit(ctx context.Context, body []byte, headers http
 	return f.resp, f.err
 }
 
+type mockBillingService struct {
+	err error
+}
+
+func (m *mockBillingService) PreAuthorize(ctx context.Context, requestID, apiKeyID string, requestBody []byte) (billingservice.PreAuthResult, error) {
+	if m.err != nil {
+		return billingservice.PreAuthResult{}, m.err
+	}
+	return billingservice.PreAuthResult{
+		LedgerID:  "bled_test",
+		RequestID: requestID,
+		APIKeyID:  apiKeyID,
+	}, nil
+}
+
 func TestSubmitHandler_PassthroughSuccess(t *testing.T) {
 	upstreamBody := []byte(`{"code":10000,"message":"ok","data":{"task_id":"task_123"}}`)
 	fake := &fakeSubmitClient{
@@ -168,7 +184,7 @@ func TestSubmitHandler_PassthroughSuccess(t *testing.T) {
 		},
 	}
 	auditSvc, dsRepo, usRepo, aeRepo := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
 
 	requestBody := []byte(`{"prompt":"cat","req_key":"jimeng_t2i_v40"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader(requestBody))
@@ -211,6 +227,15 @@ func TestSubmitHandler_PassthroughSuccess(t *testing.T) {
 	if dsRepo.created[0].Headers["Authorization"] != "***" {
 		t.Fatalf("expected downstream authorization redacted")
 	}
+	if v, ok := aeRepo.created[0].Metadata[models.AuditMetaComputedCredit].(string); !ok || v == "" {
+		t.Fatalf("expected audit metadata %s set", models.AuditMetaComputedCredit)
+	}
+	if v, ok := aeRepo.created[0].Metadata[models.AuditMetaPreAuthID].(string); !ok || v != "bled_test" {
+		t.Fatalf("expected audit metadata %s=bled_test, got %T %v", models.AuditMetaPreAuthID, aeRepo.created[0].Metadata[models.AuditMetaPreAuthID], aeRepo.created[0].Metadata[models.AuditMetaPreAuthID])
+	}
+	if v, ok := aeRepo.created[0].Metadata[models.AuditMetaResultState].(string); !ok || v != "preauth" {
+		t.Fatalf("expected audit metadata %s=preauth, got %T %v", models.AuditMetaResultState, aeRepo.created[0].Metadata[models.AuditMetaResultState], aeRepo.created[0].Metadata[models.AuditMetaResultState])
+	}
 }
 
 func TestSubmitHandler_PassthroughBusinessError(t *testing.T) {
@@ -224,7 +249,7 @@ func TestSubmitHandler_PassthroughBusinessError(t *testing.T) {
 		err: internalerrors.New(internalerrors.ErrUpstreamFailed, "upstream submit returned 429", nil),
 	}
 	auditSvc, dsRepo, usRepo, aeRepo := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -256,7 +281,7 @@ func TestSubmitHandler_UpstreamNetworkError(t *testing.T) {
 		err: internalerrors.New(internalerrors.ErrUpstreamFailed, "upstream request failed", errors.New("dial tcp: i/o timeout")),
 	}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -290,7 +315,7 @@ func TestSubmitHandler_KeyRevokedError_PropagatesUnauthorized(t *testing.T) {
 		err: internalerrors.New(internalerrors.ErrKeyRevoked, "api key revoked", nil),
 	}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -323,7 +348,7 @@ func TestSubmitHandler_CompatibleActionPath(t *testing.T) {
 	upstreamBody := []byte(`{"code":10000,"message":"ok"}`)
 	fake := &fakeSubmitClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: upstreamBody}}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/?Action=CVSync2AsyncSubmitTask&Version=2022-08-31", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -344,7 +369,7 @@ func TestSubmitHandler_AuditFailure_FailClosed(t *testing.T) {
 	upstreamBody := []byte(`{"code":10000,"message":"ok","data":{"task_id":"task_123"}}`)
 	fake := &fakeSubmitClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: upstreamBody}}
 	auditSvc, _, _, _ := newTestAuditService(t, errors.New("db down"), nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -424,7 +449,7 @@ func TestSubmitHandler_FakeUpstreamContract_Passthrough(t *testing.T) {
 				t.Fatalf("NewClient: %v", err)
 			}
 			auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-			h := NewSubmitHandler(c, auditSvc, nil, nil, nil).Routes()
+			h := NewSubmitHandler(c, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 			req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 			req.Header.Set("Content-Type", "application/json")
 			req = req.WithContext(context.WithValue(req.Context(), sigv4.ContextAPIKeyID, "k1"))
@@ -452,7 +477,7 @@ func TestSubmitHandler_IdempotencyReplaySameHash(t *testing.T) {
 	idemRepo := newRecordingIdempotencyRepo()
 	base := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 	idemSvc := idempotencyservice.NewService(idemRepo, idempotencyservice.Config{Now: func() time.Time { return base }})
-	h := NewSubmitHandler(fake, auditSvc, idemSvc, idemRepo, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, idemSvc, idemRepo, nil).Routes()
 
 	body := []byte(`{"prompt":"cat","req_key":"jimeng_t2i_v40"}`)
 	req1 := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader(body))
@@ -503,7 +528,7 @@ func TestSubmitHandler_IdempotencyHashMismatchReturnsValidationError(t *testing.
 	idemRepo := newRecordingIdempotencyRepo()
 	base := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 	idemSvc := idempotencyservice.NewService(idemRepo, idempotencyservice.Config{Now: func() time.Time { return base }})
-	h := NewSubmitHandler(fake, auditSvc, idemSvc, idemRepo, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, idemSvc, idemRepo, nil).Routes()
 
 	req1 := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req1.Header.Set("Content-Type", "application/json")
@@ -552,7 +577,7 @@ func TestSubmitHandler_IdempotencyHashMismatchReturnsValidationError(t *testing.
 func TestSubmitHandler_MissingAPIKeyID(t *testing.T) {
 	fake := &fakeSubmitClient{}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -584,7 +609,7 @@ func TestSubmitHandler_MissingAPIKeyID(t *testing.T) {
 func TestSubmitHandler_EmptyAPIKeyID(t *testing.T) {
 	fake := &fakeSubmitClient{}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -603,7 +628,7 @@ func TestSubmitHandler_RateLimitedError_PropagatesTooManyRequests(t *testing.T) 
 		err: internalerrors.New(internalerrors.ErrRateLimited, "rate limit exceeded", nil),
 	}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -662,7 +687,7 @@ func TestSubmitHandler_StatusMapping(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			fake := &fakeSubmitClient{err: tt.err}
 			auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-			h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+			h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 			req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 			req.Header.Set("Content-Type", "application/json")
@@ -699,7 +724,7 @@ func TestSubmitHandler_WrappedRateLimited_ReturnsBadGateway(t *testing.T) {
 		err: internalerrors.New(internalerrors.ErrUpstreamFailed, "wrapped", internalerrors.New(internalerrors.ErrRateLimited, "rate limit", nil)),
 	}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -719,7 +744,7 @@ func TestSubmitHandler_BodyLarge_ShouldBeAccepted(t *testing.T) {
 	upstreamBody := []byte(`{"code":10000,"message":"ok"}`)
 	fake := &fakeSubmitClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: upstreamBody}}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	largeBody := make([]byte, 15<<20) // 15MiB
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader(largeBody))
@@ -737,7 +762,7 @@ func TestSubmitHandler_BodyLarge_ShouldBeAccepted(t *testing.T) {
 func TestSubmitHandler_BodyTooLarge(t *testing.T) {
 	fake := &fakeSubmitClient{}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	// maxDownstreamBodyBytes + 1 byte should fail.
 	largeBody := make([]byte, int(maxDownstreamBodyBytes)+1)
@@ -757,7 +782,7 @@ func TestSubmitHandler_BodyNearLimit(t *testing.T) {
 	upstreamBody := []byte(`{"code":10000,"message":"ok"}`)
 	fake := &fakeSubmitClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: upstreamBody}}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	// maxDownstreamBodyBytes should be accepted.
 	nearLimitBody := make([]byte, int(maxDownstreamBodyBytes))
@@ -790,7 +815,7 @@ func TestSubmitHandler_UpstreamErrorPassthrough(t *testing.T) {
 		err: internalerrors.New(internalerrors.ErrUpstreamFailed, "upstream error", nil),
 	}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req.Header.Set("Content-Type", "application/json")

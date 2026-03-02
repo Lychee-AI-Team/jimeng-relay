@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -20,14 +21,7 @@ import (
 	"github.com/jimeng-relay/server/internal/relay/upstream"
 )
 
-var relayAcceptedVideoReqKeys = map[string]struct{}{
-	"jimeng_t2v_v30":            {},
-	"jimeng_t2v_v30_1080p":           {},
-	"jimeng_ti2v_v30_pro":            {},
-	"jimeng_i2v_first_v30_1080":      {},
-	"jimeng_i2v_first_tail_v30_1080": {},
-	"jimeng_i2v_recamera_v30":        {},
-}
+var relayAcceptedVideoReqKeys = videoReqKeySet
 
 func TestClientPresetMatrixParity_RelayContractCoverage(t *testing.T) {
 	clientPresetReqKeys := mustLoadClientPresetReqKeys(t)
@@ -51,7 +45,7 @@ func TestClientPresetMatrixParity_SubmitPassthrough(t *testing.T) {
 			upstreamBody := []byte(`{"code":10000,"message":"ok","data":{"task_id":"parity_` + preset + `"}}`)
 			fake := &fakeSubmitClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: upstreamBody}}
 			auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-			h := NewSubmitHandler(fake, auditSvc, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
+			h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
 
 			requestBody := []byte(`{"prompt":"parity test","req_key":"` + reqKey + `"}`)
 			req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader(requestBody))
@@ -65,8 +59,18 @@ func TestClientPresetMatrixParity_SubmitPassthrough(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("expected status 200, got %d body=%s", rec.Code, rec.Body.String())
 			}
-			if !bytes.Equal(fake.reqBody, requestBody) {
-				t.Fatalf("expected request body passthrough for preset %q", preset)
+			var payload map[string]any
+			if err := json.Unmarshal(fake.reqBody, &payload); err != nil {
+				t.Fatalf("json.Unmarshal upstream request body: %v", err)
+			}
+			if got, ok := payload["req_key"].(string); !ok || got != reqKey {
+				t.Fatalf("expected req_key %q for preset %q, got %#v", reqKey, preset, payload["req_key"])
+			}
+			if got, ok := payload["prompt"].(string); !ok || got != "parity test" {
+				t.Fatalf("expected prompt passthrough for preset %q, got %#v", preset, payload["prompt"])
+			}
+			if got, ok := payload["frames"].(float64); !ok || int(got) != 121 {
+				t.Fatalf("expected normalized frames=121 for preset %q, got %#v", preset, payload["frames"])
 			}
 			if !bytes.Equal(rec.Body.Bytes(), upstreamBody) {
 				t.Fatalf("expected response body passthrough for preset %q", preset)
@@ -86,6 +90,42 @@ func TestClientPresetMatrixParity_DetectsMismatch(t *testing.T) {
 	if !strings.Contains(err.Error(), "jimeng_simulated_not_supported") {
 		t.Fatalf("expected mismatch error to include unsupported req_key, got %v", err)
 	}
+}
+
+func TestVideoFramesParityFunctions(t *testing.T) {
+	t.Run("validate", func(t *testing.T) {
+		if err := ValidateVideoFrames(121); err != nil {
+			t.Fatalf("ValidateVideoFrames(121) unexpected error: %v", err)
+		}
+		if err := ValidateVideoFrames(241); err != nil {
+			t.Fatalf("ValidateVideoFrames(241) unexpected error: %v", err)
+		}
+		if err := ValidateVideoFrames(120); err == nil {
+			t.Fatalf("ValidateVideoFrames(120) expected error")
+		}
+	})
+
+	t.Run("normalize", func(t *testing.T) {
+		if got := NormalizeVideoFrames(nil); got != 121 {
+			t.Fatalf("NormalizeVideoFrames(nil) = %d, want 121", got)
+		}
+		frames := 241
+		if got := NormalizeVideoFrames(&frames); got != 241 {
+			t.Fatalf("NormalizeVideoFrames(&241) = %d, want 241", got)
+		}
+	})
+
+	t.Run("duration", func(t *testing.T) {
+		if got, err := FramesToDuration(121); err != nil || got != 5 {
+			t.Fatalf("FramesToDuration(121) = (%d, %v), want (5, nil)", got, err)
+		}
+		if got, err := FramesToDuration(241); err != nil || got != 10 {
+			t.Fatalf("FramesToDuration(241) = (%d, %v), want (10, nil)", got, err)
+		}
+		if _, err := FramesToDuration(120); err == nil {
+			t.Fatalf("FramesToDuration(120) expected error")
+		}
+	})
 }
 
 func detectReqKeyParityMismatch(clientPresetReqKeys map[string]string, relayAcceptedReqKeys map[string]struct{}) error {

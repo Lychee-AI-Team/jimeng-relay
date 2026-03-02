@@ -37,7 +37,7 @@ func TestObservabilityFields(t *testing.T) {
 		},
 	}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, logger).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, logger).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -89,7 +89,7 @@ func TestObservabilityFields_Error(t *testing.T) {
 		},
 	}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, logger).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, logger).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader([]byte(`{"prompt":"cat"}`)))
 	req.Header.Set("Content-Type", "application/json")

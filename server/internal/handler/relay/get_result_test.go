@@ -14,6 +14,7 @@ import (
 	"github.com/jimeng-relay/server/internal/config"
 	internalerrors "github.com/jimeng-relay/server/internal/errors"
 	"github.com/jimeng-relay/server/internal/middleware/sigv4"
+	"github.com/jimeng-relay/server/internal/models"
 	"github.com/jimeng-relay/server/internal/relay/upstream"
 )
 
@@ -25,6 +26,29 @@ type fakeGetResultClient struct {
 	reqBody    []byte
 	reqHeaders http.Header
 	ctx        context.Context
+}
+
+type mockGetResultBillingService struct {
+	settleCalls  int
+	releaseCalls int
+	requestID    string
+	apiKeyID     string
+	settleErr    error
+	releaseErr   error
+}
+
+func (m *mockGetResultBillingService) Settle(_ context.Context, requestID, apiKeyID string) error {
+	m.settleCalls++
+	m.requestID = requestID
+	m.apiKeyID = apiKeyID
+	return m.settleErr
+}
+
+func (m *mockGetResultBillingService) Release(_ context.Context, requestID, apiKeyID string) error {
+	m.releaseCalls++
+	m.requestID = requestID
+	m.apiKeyID = apiKeyID
+	return m.releaseErr
 }
 
 func (f *fakeGetResultClient) GetResult(ctx context.Context, body []byte, headers http.Header) (*upstream.Response, error) {
@@ -47,7 +71,7 @@ func TestGetResultHandler_PassthroughSuccess(t *testing.T) {
 		},
 	}
 	auditSvc, dsRepo, usRepo, aeRepo := newTestAuditService(t, nil, nil, nil)
-	h := NewGetResultHandler(fake, auditSvc, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
+	h := NewGetResultHandler(fake, auditSvc, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
 
 	requestBody := []byte(`{"task_id":"task_123"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader(requestBody))
@@ -91,6 +115,107 @@ func TestGetResultHandler_PassthroughSuccess(t *testing.T) {
 	}
 }
 
+func TestGetResultHandler_DoneStatus_ShouldSettlePreAuth(t *testing.T) {
+	upstreamBody := []byte(`{"code":10000,"message":"ok","data":{"task_status":"Done"}}`)
+	fake := &fakeGetResultClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: upstreamBody}}
+	auditSvc, _, _, aeRepo := newTestAuditService(t, nil, nil, nil)
+	billingSvc := &mockGetResultBillingService{}
+	h := NewGetResultHandler(fake, auditSvc, billingSvc, nil).Routes()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader([]byte(`{"task_id":"task_123"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Request-Id", "req-settle")
+	req = req.WithContext(context.WithValue(req.Context(), sigv4.ContextAPIKeyID, "k1"))
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if billingSvc.settleCalls != 1 {
+		t.Fatalf("expected settle called once, got %d", billingSvc.settleCalls)
+	}
+	if billingSvc.releaseCalls != 0 {
+		t.Fatalf("expected release not called, got %d", billingSvc.releaseCalls)
+	}
+	if billingSvc.requestID != "req-settle" || billingSvc.apiKeyID != "k1" {
+		t.Fatalf("unexpected settle args requestID=%q apiKeyID=%q", billingSvc.requestID, billingSvc.apiKeyID)
+	}
+	if len(aeRepo.created) != 1 {
+		t.Fatalf("expected 1 audit event, got %d", len(aeRepo.created))
+	}
+	if v, ok := aeRepo.created[0].Metadata[models.AuditMetaSettlementID].(string); !ok || v != "req-settle" {
+		t.Fatalf("expected audit metadata %s=req-settle, got %T %v", models.AuditMetaSettlementID, aeRepo.created[0].Metadata[models.AuditMetaSettlementID], aeRepo.created[0].Metadata[models.AuditMetaSettlementID])
+	}
+	if v, ok := aeRepo.created[0].Metadata[models.AuditMetaResultState].(string); !ok || v != "settled" {
+		t.Fatalf("expected audit metadata %s=settled, got %T %v", models.AuditMetaResultState, aeRepo.created[0].Metadata[models.AuditMetaResultState], aeRepo.created[0].Metadata[models.AuditMetaResultState])
+	}
+}
+
+func TestGetResultHandler_FailedStatus_ShouldReleasePreAuth(t *testing.T) {
+	upstreamBody := []byte(`{"code":10000,"message":"ok","data":{"task_status":"Failed"}}`)
+	fake := &fakeGetResultClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: upstreamBody}}
+	auditSvc, _, _, aeRepo := newTestAuditService(t, nil, nil, nil)
+	billingSvc := &mockGetResultBillingService{}
+	h := NewGetResultHandler(fake, auditSvc, billingSvc, nil).Routes()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader([]byte(`{"task_id":"task_123"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Request-Id", "req-release")
+	req = req.WithContext(context.WithValue(req.Context(), sigv4.ContextAPIKeyID, "k1"))
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if billingSvc.releaseCalls != 1 {
+		t.Fatalf("expected release called once, got %d", billingSvc.releaseCalls)
+	}
+	if billingSvc.settleCalls != 0 {
+		t.Fatalf("expected settle not called, got %d", billingSvc.settleCalls)
+	}
+	if billingSvc.requestID != "req-release" || billingSvc.apiKeyID != "k1" {
+		t.Fatalf("unexpected release args requestID=%q apiKeyID=%q", billingSvc.requestID, billingSvc.apiKeyID)
+	}
+	if len(aeRepo.created) != 1 {
+		t.Fatalf("expected 1 audit event, got %d", len(aeRepo.created))
+	}
+	if v, ok := aeRepo.created[0].Metadata[models.AuditMetaSettlementID].(string); !ok || v != "req-release" {
+		t.Fatalf("expected audit metadata %s=req-release, got %T %v", models.AuditMetaSettlementID, aeRepo.created[0].Metadata[models.AuditMetaSettlementID], aeRepo.created[0].Metadata[models.AuditMetaSettlementID])
+	}
+	if v, ok := aeRepo.created[0].Metadata[models.AuditMetaResultState].(string); !ok || v != "released" {
+		t.Fatalf("expected audit metadata %s=released, got %T %v", models.AuditMetaResultState, aeRepo.created[0].Metadata[models.AuditMetaResultState], aeRepo.created[0].Metadata[models.AuditMetaResultState])
+	}
+}
+
+func TestGetResultHandler_UpstreamError_ShouldReleasePreAuth(t *testing.T) {
+	fake := &fakeGetResultClient{err: internalerrors.New(internalerrors.ErrUpstreamFailed, "upstream request failed", errors.New("dial tcp: i/o timeout"))}
+	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
+	billingSvc := &mockGetResultBillingService{}
+	h := NewGetResultHandler(fake, auditSvc, billingSvc, nil).Routes()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader([]byte(`{"task_id":"task_123"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Request-Id", "req-error-release")
+	req = req.WithContext(context.WithValue(req.Context(), sigv4.ContextAPIKeyID, "k1"))
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected status 502, got %d", rec.Code)
+	}
+	if billingSvc.releaseCalls != 1 {
+		t.Fatalf("expected release called once on upstream error, got %d", billingSvc.releaseCalls)
+	}
+	if billingSvc.settleCalls != 0 {
+		t.Fatalf("expected settle not called, got %d", billingSvc.settleCalls)
+	}
+}
+
 func TestGetResultHandler_PassthroughBusinessError(t *testing.T) {
 	upstreamBody := []byte(`{"code":40011,"status":40011,"message":"invalid task_id"}`)
 	fake := &fakeGetResultClient{
@@ -102,7 +227,7 @@ func TestGetResultHandler_PassthroughBusinessError(t *testing.T) {
 		err: internalerrors.New(internalerrors.ErrUpstreamFailed, "upstream get-result returned 400", nil),
 	}
 	auditSvc, dsRepo, usRepo, aeRepo := newTestAuditService(t, nil, nil, nil)
-	h := NewGetResultHandler(fake, auditSvc, nil).Routes()
+	h := NewGetResultHandler(fake, auditSvc, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader([]byte(`{"task_id":"invalid"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -134,7 +259,7 @@ func TestGetResultHandler_UpstreamNetworkError(t *testing.T) {
 		err: internalerrors.New(internalerrors.ErrUpstreamFailed, "upstream request failed", errors.New("dial tcp: i/o timeout")),
 	}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewGetResultHandler(fake, auditSvc, nil).Routes()
+	h := NewGetResultHandler(fake, auditSvc, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader([]byte(`{"task_id":"task_123"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -168,7 +293,7 @@ func TestGetResultHandler_KeyRevokedError_PropagatesUnauthorized(t *testing.T) {
 		err: internalerrors.New(internalerrors.ErrKeyRevoked, "api key revoked", nil),
 	}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewGetResultHandler(fake, auditSvc, nil).Routes()
+	h := NewGetResultHandler(fake, auditSvc, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader([]byte(`{"task_id":"t1"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -201,7 +326,7 @@ func TestGetResultHandler_CompatibleActionPath(t *testing.T) {
 	upstreamBody := []byte(`{"code":10000,"message":"ok","data":{"status":"done"}}`)
 	fake := &fakeGetResultClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: upstreamBody}}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewGetResultHandler(fake, auditSvc, nil).Routes()
+	h := NewGetResultHandler(fake, auditSvc, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/?Action=CVSync2AsyncGetResult&Version=2022-08-31", bytes.NewReader([]byte(`{"task_id":"task_123"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -222,7 +347,7 @@ func TestGetResultHandler_AuditFailure_FailClosed(t *testing.T) {
 	upstreamBody := []byte(`{"code":10000,"message":"ok","data":{"status":"done"}}`)
 	fake := &fakeGetResultClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: upstreamBody}}
 	auditSvc, _, _, _ := newTestAuditService(t, errors.New("db down"), nil, nil)
-	h := NewGetResultHandler(fake, auditSvc, nil).Routes()
+	h := NewGetResultHandler(fake, auditSvc, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader([]byte(`{"task_id":"task_123"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -258,7 +383,7 @@ func TestGetResultHandler_AuditFailure_FailClosed(t *testing.T) {
 func TestGetResultHandler_MissingAPIKey(t *testing.T) {
 	fake := &fakeGetResultClient{}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewGetResultHandler(fake, auditSvc, nil).Routes()
+	h := NewGetResultHandler(fake, auditSvc, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader([]byte(`{"task_id":"task_123"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -334,7 +459,7 @@ func TestGetResultHandler_FakeUpstreamContract_Passthrough(t *testing.T) {
 				t.Fatalf("NewClient: %v", err)
 			}
 			auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-			h := NewGetResultHandler(c, auditSvc, nil).Routes()
+			h := NewGetResultHandler(c, auditSvc, nil, nil).Routes()
 			req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader([]byte(`{"task_id":"task_123"}`)))
 			req.Header.Set("Content-Type", "application/json")
 			req = req.WithContext(context.WithValue(req.Context(), sigv4.ContextAPIKeyID, "k1"))
@@ -359,7 +484,7 @@ func TestGetResultHandler_RateLimitedError_PropagatesTooManyRequests(t *testing.
 		err: internalerrors.New(internalerrors.ErrRateLimited, "rate limit exceeded", nil),
 	}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewGetResultHandler(fake, auditSvc, nil).Routes()
+	h := NewGetResultHandler(fake, auditSvc, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader([]byte(`{"task_id":"t1"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -418,7 +543,7 @@ func TestGetResultHandler_StatusMapping(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			fake := &fakeGetResultClient{err: tt.err}
 			auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-			h := NewGetResultHandler(fake, auditSvc, nil).Routes()
+			h := NewGetResultHandler(fake, auditSvc, nil, nil).Routes()
 
 			req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader([]byte(`{"task_id":"t1"}`)))
 			req.Header.Set("Content-Type", "application/json")
@@ -454,7 +579,7 @@ func TestGetResultHandler_WrappedRateLimited_ReturnsBadGateway(t *testing.T) {
 		err: internalerrors.New(internalerrors.ErrUpstreamFailed, "wrapped", internalerrors.New(internalerrors.ErrRateLimited, "rate limit", nil)),
 	}
 	auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewGetResultHandler(fake, auditSvc, nil).Routes()
+	h := NewGetResultHandler(fake, auditSvc, nil, nil).Routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader([]byte(`{"task_id":"t1"}`)))
 	req.Header.Set("Content-Type", "application/json")

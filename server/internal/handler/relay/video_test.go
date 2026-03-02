@@ -49,7 +49,7 @@ func TestSubmitVideoReqKeyPassthrough(t *testing.T) {
 					upstreamBody := []byte(`{"code":10000,"message":"ok","data":{"task_id":"video_task_1"}}`)
 					fake := &fakeSubmitClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: upstreamBody}}
 					auditSvc, dsRepo, usRepo, aeRepo := newTestAuditService(t, nil, nil, nil)
-					h := NewSubmitHandler(fake, auditSvc, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
+					h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
 
 					requestBody := []byte(`{"prompt":"video test","req_key":"` + reqKey + `"}`)
 					req := httptest.NewRequest(http.MethodPost, tt.path, bytes.NewReader(requestBody))
@@ -63,8 +63,18 @@ func TestSubmitVideoReqKeyPassthrough(t *testing.T) {
 					if rec.Code != http.StatusOK {
 						t.Fatalf("expected status 200, got %d body=%s", rec.Code, rec.Body.String())
 					}
-					if !bytes.Equal(fake.reqBody, requestBody) {
-						t.Fatalf("expected video request body passthrough to upstream")
+					var payload map[string]any
+					if err := json.Unmarshal(fake.reqBody, &payload); err != nil {
+						t.Fatalf("json.Unmarshal upstream request body: %v", err)
+					}
+					if got, ok := payload["req_key"].(string); !ok || got != reqKey {
+						t.Fatalf("expected req_key %q, got %#v", reqKey, payload["req_key"])
+					}
+					if got, ok := payload["prompt"].(string); !ok || got != "video test" {
+						t.Fatalf("expected prompt passthrough, got %#v", payload["prompt"])
+					}
+					if got, ok := payload["frames"].(float64); !ok || int(got) != 121 {
+						t.Fatalf("expected normalized frames=121, got %#v", payload["frames"])
 					}
 					if fake.calls != 1 {
 						t.Fatalf("expected 1 upstream call, got %d", fake.calls)
@@ -82,6 +92,69 @@ func TestSubmitVideoReqKeyPassthrough(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSubmitVideoFramesParity(t *testing.T) {
+	t.Run("rejects invalid frames with 400", func(t *testing.T) {
+		fake := &fakeSubmitClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"code":10000}`)}}
+		auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
+		h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
+
+		requestBody := []byte(`{"prompt":"video test","req_key":"jimeng_t2v_v30","frames":120}`)
+		req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader(requestBody))
+		req.Header.Set("Content-Type", "application/json")
+		req = req.WithContext(context.WithValue(req.Context(), sigv4.ContextAPIKeyID, "k-video"))
+		rec := httptest.NewRecorder()
+
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		if fake.calls != 0 {
+			t.Fatalf("expected no upstream call, got %d", fake.calls)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("json.Unmarshal response: %v", err)
+		}
+		errorObj, ok := payload["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected error object, got %T", payload["error"])
+		}
+		if got, ok := errorObj["code"].(string); !ok || got != string(internalerrors.ErrValidationFailed) {
+			t.Fatalf("expected error code %q, got %#v", internalerrors.ErrValidationFailed, errorObj["code"])
+		}
+	})
+
+	t.Run("accepts explicit 241 frames", func(t *testing.T) {
+		upstreamBody := []byte(`{"code":10000,"message":"ok","data":{"task_id":"video_task_241"}}`)
+		fake := &fakeSubmitClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: upstreamBody}}
+		auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
+		h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
+
+		requestBody := []byte(`{"prompt":"video test","req_key":"jimeng_t2v_v30","frames":241}`)
+		req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader(requestBody))
+		req.Header.Set("Content-Type", "application/json")
+		req = req.WithContext(context.WithValue(req.Context(), sigv4.ContextAPIKeyID, "k-video"))
+		rec := httptest.NewRecorder()
+
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		if fake.calls != 1 {
+			t.Fatalf("expected 1 upstream call, got %d", fake.calls)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(fake.reqBody, &payload); err != nil {
+			t.Fatalf("json.Unmarshal upstream request body: %v", err)
+		}
+		if got, ok := payload["frames"].(float64); !ok || int(got) != 241 {
+			t.Fatalf("expected frames=241, got %#v", payload["frames"])
+		}
+	})
 }
 
 func TestGetResultVideoReqKeyPassthrough(t *testing.T) {
@@ -102,7 +175,7 @@ func TestGetResultVideoReqKeyPassthrough(t *testing.T) {
 					upstreamBody := []byte(`{"code":10000,"message":"ok","data":{"status":"running"}}`)
 					fake := &fakeGetResultClient{resp: &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: upstreamBody}}
 					auditSvc, dsRepo, usRepo, aeRepo := newTestAuditService(t, nil, nil, nil)
-					h := NewGetResultHandler(fake, auditSvc, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
+					h := NewGetResultHandler(fake, auditSvc, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
 
 					requestBody := []byte(`{"task_id":"video_task_1","req_key":"` + reqKey + `"}`)
 					req := httptest.NewRequest(http.MethodPost, tt.path, bytes.NewReader(requestBody))
@@ -140,7 +213,7 @@ func TestGetResultVideoReqKeyPassthrough(t *testing.T) {
 func TestSubmitVideoRateLimitedByKey(t *testing.T) {
 	fake := &fakeSubmitClient{err: internalerrors.New(internalerrors.ErrRateLimited, "rate limit exceeded", nil)}
 	auditSvc, dsRepo, _, _ := newTestAuditService(t, nil, nil, nil)
-	h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+	h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 	requestBody := []byte(`{"prompt":"video test","req_key":"` + videoSubmitReqKey + `"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader(requestBody))
@@ -220,7 +293,7 @@ func TestRateLimitVideo_SameAPIKeyConcurrentSubmitReturns429(t *testing.T) {
 			}
 
 			auditSvc := newConcurrentTestAuditService(t)
-			h := NewSubmitHandler(c, auditSvc, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
+			h := NewSubmitHandler(c, auditSvc, &mockBillingService{}, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
 
 			body := []byte(`{"prompt":"video test","req_key":"` + videoSubmitReqKey + `"}`)
 
@@ -337,7 +410,7 @@ func TestRateLimitVideo_GlobalQueueFullSubmitReturns429(t *testing.T) {
 			}
 
 			auditSvc := newConcurrentTestAuditService(t)
-			h := NewSubmitHandler(c, auditSvc, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
+			h := NewSubmitHandler(c, auditSvc, &mockBillingService{}, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
 
 			body := []byte(`{"prompt":"video test","req_key":"` + videoSubmitReqKey + `"}`)
 
@@ -454,7 +527,7 @@ func TestConcurrencyPolicy_SameKeyImmediate429(t *testing.T) {
 		t.Fatalf("upstream.NewClient: %v", err)
 	}
 
-	h := NewSubmitHandler(c, newConcurrentTestAuditService(t), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
+	h := NewSubmitHandler(c, newConcurrentTestAuditService(t), &mockBillingService{}, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
 	body := []byte(`{"prompt":"video test","req_key":"` + videoSubmitReqKey + `"}`)
 
 	firstDone := make(chan *httptest.ResponseRecorder, 1)
@@ -540,7 +613,7 @@ func TestConcurrencyPolicy_DifferentKeyFIFO(t *testing.T) {
 		t.Fatalf("upstream.NewClient: %v", err)
 	}
 
-	h := NewSubmitHandler(c, newConcurrentTestAuditService(t), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
+	h := NewSubmitHandler(c, newConcurrentTestAuditService(t), &mockBillingService{}, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Routes()
 	body := []byte(`{"prompt":"video test","req_key":"` + videoSubmitReqKey + `"}`)
 
 	firstDone := make(chan *httptest.ResponseRecorder, 1)
@@ -605,7 +678,7 @@ func TestVideoValidationErrors(t *testing.T) {
 	t.Run("submit validation failed -> 400 with validation code", func(t *testing.T) {
 		fake := &fakeSubmitClient{err: internalerrors.New(internalerrors.ErrValidationFailed, "req_key mismatch: expected jimeng_video_v30", nil)}
 		auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-		h := NewSubmitHandler(fake, auditSvc, nil, nil, nil).Routes()
+		h := NewSubmitHandler(fake, auditSvc, &mockBillingService{}, nil, nil, nil).Routes()
 
 		body := []byte(`{"prompt":"video test","req_key":"jimeng_video_query_v30"}`)
 		req := httptest.NewRequest(http.MethodPost, "/v1/submit", bytes.NewReader(body))
@@ -638,7 +711,7 @@ func TestVideoValidationErrors(t *testing.T) {
 	t.Run("get-result validation failed -> 400 with validation code", func(t *testing.T) {
 		fake := &fakeGetResultClient{err: internalerrors.New(internalerrors.ErrValidationFailed, "invalid i2v combination: i2v-first must not include frames", nil)}
 		auditSvc, _, _, _ := newTestAuditService(t, nil, nil, nil)
-		h := NewGetResultHandler(fake, auditSvc, nil).Routes()
+		h := NewGetResultHandler(fake, auditSvc, nil, nil).Routes()
 
 		body := []byte(`{"task_id":"video-task-1","req_key":"jimeng_video_query_v30"}`)
 		req := httptest.NewRequest(http.MethodPost, "/v1/get-result", bytes.NewReader(body))
