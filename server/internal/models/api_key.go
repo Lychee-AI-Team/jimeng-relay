@@ -19,6 +19,7 @@ type APIKey struct {
 	SecretKeyHash       string       `json:"secret_key_hash"`
 	SecretKeyCiphertext string       `json:"-"`
 	Description         string       `json:"description,omitempty"`
+	Multiplier          int          `json:"multiplier"`
 	CreatedAt           time.Time    `json:"created_at"`
 	UpdatedAt           time.Time    `json:"updated_at"`
 	ExpiresAt           *time.Time   `json:"expires_at,omitempty"`

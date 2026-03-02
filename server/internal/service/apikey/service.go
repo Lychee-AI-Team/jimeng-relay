@@ -132,8 +132,10 @@ func (s *Service) createKey(ctx context.Context, description string, expiresAt *
 		UpdatedAt:           now,
 		ExpiresAt:           expiresAt,
 		RotationOf:          rotationOf,
+		Multiplier:          10000,
 		Status:              models.APIKeyStatusActive,
 	}
+
 	if err := key.Validate(); err != nil {
 		return KeyWithSecret{}, internalerrors.New(internalerrors.ErrValidationFailed, "validate api key", err)
 	}

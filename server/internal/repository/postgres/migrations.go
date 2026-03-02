@@ -108,7 +108,102 @@ var migrations = []migration{
 			`ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS secret_key_ciphertext TEXT NOT NULL DEFAULT ''`,
 		},
 	},
+	{
+		version: 3,
+		name:    "billing_schema",
+		statements: []string{
+			`ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS multiplier INTEGER NOT NULL DEFAULT 10000`,
+
+
+			`CREATE TABLE IF NOT EXISTS pricing_presets (
+				preset TEXT PRIMARY KEY,
+				credit_per_second DECIMAL(10,4) NOT NULL,
+				description TEXT,
+				created_at TIMESTAMPTZ NOT NULL,
+				updated_at TIMESTAMPTZ NOT NULL
+			)`,
+
+			`CREATE TABLE IF NOT EXISTS key_budgets (
+				id TEXT PRIMARY KEY,
+				api_key_id TEXT UNIQUE REFERENCES api_keys(id),
+				credits_remaining DECIMAL(20,4) NOT NULL DEFAULT 0,
+				credits_reserved DECIMAL(20,4) NOT NULL DEFAULT 0,
+				created_at TIMESTAMPTZ NOT NULL,
+				updated_at TIMESTAMPTZ NOT NULL
+			)`,
+
+			`CREATE TABLE IF NOT EXISTS billing_ledger (
+				id TEXT PRIMARY KEY,
+				api_key_id TEXT NOT NULL REFERENCES api_keys(id),
+				request_id TEXT NOT NULL,
+				idempotency_key TEXT,
+				preset TEXT NOT NULL,
+				base_cost DECIMAL(10,4) NOT NULL,
+				multiplier INTEGER NOT NULL,
+				duration_seconds INTEGER,
+				total_cost DECIMAL(10,4) NOT NULL,
+				status TEXT NOT NULL,
+				pricing_snapshot JSONB,
+				created_at TIMESTAMPTZ NOT NULL,
+				settled_at TIMESTAMPTZ,
+				UNIQUE(request_id)
+			)`,
+		},
+	},
+	{
+		version: 4,
+		name:    "admin_auth_schema",
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS admin_users (
+				id TEXT PRIMARY KEY,
+				email TEXT NOT NULL UNIQUE,
+				password_hash TEXT NOT NULL,
+				created_at TIMESTAMPTZ NOT NULL,
+				updated_at TIMESTAMPTZ NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_admin_users_email ON admin_users(email)`,
+
+			`CREATE TABLE IF NOT EXISTS admin_sessions (
+				id TEXT PRIMARY KEY,
+				admin_user_id TEXT NOT NULL REFERENCES admin_users(id),
+				token_hash TEXT NOT NULL UNIQUE,
+				created_at TIMESTAMPTZ NOT NULL,
+				expires_at TIMESTAMPTZ NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_admin_sessions_admin_user_id ON admin_sessions(admin_user_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_admin_sessions_token_hash ON admin_sessions(token_hash)`,
+			`CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at)`,
+
+			`CREATE TABLE IF NOT EXISTS password_reset_tokens (
+				id TEXT PRIMARY KEY,
+				admin_user_id TEXT NOT NULL REFERENCES admin_users(id),
+				token_hash TEXT NOT NULL UNIQUE,
+				created_at TIMESTAMPTZ NOT NULL,
+				expires_at TIMESTAMPTZ NOT NULL,
+				used_at TIMESTAMPTZ
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_admin_user_id ON password_reset_tokens(admin_user_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_token_hash ON password_reset_tokens(token_hash)`,
+			`CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)`,
+		},
+	},
+	{
+		version: 5,
+		name:    "billing_ledger_request_id_unique",
+		statements: []string{
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_ledger_request_id ON billing_ledger(request_id)`,
+		},
+	},
+	{
+		version: 6,
+		name:    "default_multiplier_10000",
+		statements: []string{
+			`ALTER TABLE api_keys ALTER COLUMN multiplier SET DEFAULT 10000`,
+			`UPDATE api_keys SET multiplier = 10000 WHERE multiplier = 1`,
+		},
+	},
 }
+
 
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	if pool == nil {

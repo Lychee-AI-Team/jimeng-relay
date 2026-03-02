@@ -85,6 +85,18 @@ func (db *DB) IdempotencyRecords() repository.IdempotencyRecordRepository {
 	return &idempotencyRecordRepository{pool: db.pool}
 }
 
+func (db *DB) AdminUsers() repository.AdminUserRepository {
+	return &adminUserRepository{pool: db.pool}
+}
+
+func (db *DB) AdminSessions() repository.AdminSessionRepository {
+	return &adminSessionRepository{pool: db.pool}
+}
+
+func (db *DB) PasswordResetTokens() repository.PasswordResetTokenRepository {
+	return &passwordResetTokenRepository{pool: db.pool}
+}
+
 type apiKeyRepository struct {
 	pool *pgxpool.Pool
 }
@@ -129,7 +141,7 @@ func (r *apiKeyRepository) GetByAccessKey(ctx context.Context, accessKey string)
 	if accessKey == "" {
 		return models.APIKey{}, internalerrors.New(internalerrors.ErrValidationFailed, "accessKey is required", nil)
 	}
-	return r.getOne(ctx, `SELECT id, access_key, secret_key_hash, secret_key_ciphertext, description, created_at, updated_at, expires_at, revoked_at, rotation_of, status
+	return r.getOne(ctx, `SELECT id, access_key, secret_key_hash, secret_key_ciphertext, description, multiplier, created_at, updated_at, expires_at, revoked_at, rotation_of, status
 		FROM api_keys WHERE access_key = $1`, accessKey)
 }
 
@@ -138,7 +150,7 @@ func (r *apiKeyRepository) GetByID(ctx context.Context, id string) (models.APIKe
 	if id == "" {
 		return models.APIKey{}, internalerrors.New(internalerrors.ErrValidationFailed, "id is required", nil)
 	}
-	return r.getOne(ctx, `SELECT id, access_key, secret_key_hash, secret_key_ciphertext, description, created_at, updated_at, expires_at, revoked_at, rotation_of, status
+	return r.getOne(ctx, `SELECT id, access_key, secret_key_hash, secret_key_ciphertext, description, multiplier, created_at, updated_at, expires_at, revoked_at, rotation_of, status
 		FROM api_keys WHERE id = $1`, id)
 }
 
@@ -155,6 +167,7 @@ func (r *apiKeyRepository) getOne(ctx context.Context, query string, arg any) (m
 		&key.SecretKeyHash,
 		&key.SecretKeyCiphertext,
 		&key.Description,
+		&key.Multiplier,
 		&key.CreatedAt,
 		&key.UpdatedAt,
 		&expiresAt,
@@ -175,7 +188,7 @@ func (r *apiKeyRepository) getOne(ctx context.Context, query string, arg any) (m
 }
 
 func (r *apiKeyRepository) List(ctx context.Context) ([]models.APIKey, error) {
-	rows, err := r.pool.Query(ctx, `SELECT id, access_key, secret_key_hash, secret_key_ciphertext, description, created_at, updated_at, expires_at, revoked_at, rotation_of, status
+	rows, err := r.pool.Query(ctx, `SELECT id, access_key, secret_key_hash, secret_key_ciphertext, description, multiplier, created_at, updated_at, expires_at, revoked_at, rotation_of, status
 		FROM api_keys ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, internalerrors.New(internalerrors.ErrDatabaseError, "list api keys", err)
@@ -195,6 +208,7 @@ func (r *apiKeyRepository) List(ctx context.Context) ([]models.APIKey, error) {
 			&key.SecretKeyHash,
 			&key.SecretKeyCiphertext,
 			&key.Description,
+			&key.Multiplier,
 			&key.CreatedAt,
 			&key.UpdatedAt,
 			&expiresAt,
@@ -719,6 +733,222 @@ func (r *idempotencyRecordRepository) DeleteExpired(ctx context.Context, now tim
 	tag, err := r.pool.Exec(ctx, `DELETE FROM idempotency_records WHERE expires_at <= $1`, now.UTC())
 	if err != nil {
 		return 0, internalerrors.New(internalerrors.ErrDatabaseError, "delete expired idempotency records", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+type adminUserRepository struct {
+	pool *pgxpool.Pool
+}
+
+func (r *adminUserRepository) Create(ctx context.Context, user models.AdminUser) error {
+	if err := user.Validate(); err != nil {
+		return internalerrors.New(internalerrors.ErrValidationFailed, "validate admin user", err)
+	}
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO admin_users (id, email, password_hash, created_at, updated_at) VALUES ($1, $2, $3, $4, $5)`,
+		user.ID,
+		user.Email,
+		user.PasswordHash,
+		user.CreatedAt.UTC(),
+		user.UpdatedAt.UTC(),
+	)
+	if err != nil {
+		return internalerrors.New(internalerrors.ErrDatabaseError, "insert admin user", err)
+	}
+	return nil
+}
+
+func (r *adminUserRepository) GetByID(ctx context.Context, id string) (models.AdminUser, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return models.AdminUser{}, internalerrors.New(internalerrors.ErrValidationFailed, "id is required", nil)
+	}
+	return r.getOne(ctx, `SELECT id, email, password_hash, created_at, updated_at FROM admin_users WHERE id = $1`, id)
+}
+
+func (r *adminUserRepository) GetByEmail(ctx context.Context, email string) (models.AdminUser, error) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return models.AdminUser{}, internalerrors.New(internalerrors.ErrValidationFailed, "email is required", nil)
+	}
+	return r.getOne(ctx, `SELECT id, email, password_hash, created_at, updated_at FROM admin_users WHERE email = $1`, email)
+}
+
+func (r *adminUserRepository) getOne(ctx context.Context, query string, arg any) (models.AdminUser, error) {
+	var out models.AdminUser
+	row := r.pool.QueryRow(ctx, query, arg)
+	if err := row.Scan(&out.ID, &out.Email, &out.PasswordHash, &out.CreatedAt, &out.UpdatedAt); err != nil {
+		if err == pgx.ErrNoRows {
+			return models.AdminUser{}, repository.ErrNotFound
+		}
+		return models.AdminUser{}, internalerrors.New(internalerrors.ErrDatabaseError, "select admin user", err)
+	}
+	return out, nil
+}
+
+func (r *adminUserRepository) Update(ctx context.Context, user models.AdminUser) error {
+	if err := user.Validate(); err != nil {
+		return internalerrors.New(internalerrors.ErrValidationFailed, "validate admin user", err)
+	}
+	var returnedID string
+	row := r.pool.QueryRow(ctx,
+		`UPDATE admin_users SET email = $2, password_hash = $3, updated_at = $4 WHERE id = $1 RETURNING id`,
+		user.ID,
+		user.Email,
+		user.PasswordHash,
+		user.UpdatedAt.UTC(),
+	)
+	if err := row.Scan(&returnedID); err != nil {
+		if err == pgx.ErrNoRows {
+			return repository.ErrNotFound
+		}
+		return internalerrors.New(internalerrors.ErrDatabaseError, "update admin user", err)
+	}
+	return nil
+}
+
+type adminSessionRepository struct {
+	pool *pgxpool.Pool
+}
+
+func (r *adminSessionRepository) Create(ctx context.Context, session models.AdminSession) error {
+	if err := session.Validate(); err != nil {
+		return internalerrors.New(internalerrors.ErrValidationFailed, "validate admin session", err)
+	}
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO admin_sessions (id, admin_user_id, token_hash, created_at, expires_at) VALUES ($1, $2, $3, $4, $5)`,
+		session.ID,
+		session.AdminUserID,
+		session.TokenHash,
+		session.CreatedAt.UTC(),
+		session.ExpiresAt.UTC(),
+	)
+	if err != nil {
+		return internalerrors.New(internalerrors.ErrDatabaseError, "insert admin session", err)
+	}
+	return nil
+}
+
+func (r *adminSessionRepository) GetByTokenHash(ctx context.Context, tokenHash string) (models.AdminSession, error) {
+	tokenHash = strings.TrimSpace(tokenHash)
+	if tokenHash == "" {
+		return models.AdminSession{}, internalerrors.New(internalerrors.ErrValidationFailed, "tokenHash is required", nil)
+	}
+	var out models.AdminSession
+	row := r.pool.QueryRow(ctx,
+		`SELECT id, admin_user_id, token_hash, created_at, expires_at FROM admin_sessions WHERE token_hash = $1`,
+		tokenHash,
+	)
+	if err := row.Scan(&out.ID, &out.AdminUserID, &out.TokenHash, &out.CreatedAt, &out.ExpiresAt); err != nil {
+		if err == pgx.ErrNoRows {
+			return models.AdminSession{}, repository.ErrNotFound
+		}
+		return models.AdminSession{}, internalerrors.New(internalerrors.ErrDatabaseError, "select admin session", err)
+	}
+	return out, nil
+}
+
+func (r *adminSessionRepository) Delete(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return internalerrors.New(internalerrors.ErrValidationFailed, "id is required", nil)
+	}
+	var returnedID string
+	row := r.pool.QueryRow(ctx, `DELETE FROM admin_sessions WHERE id = $1 RETURNING id`, id)
+	if err := row.Scan(&returnedID); err != nil {
+		if err == pgx.ErrNoRows {
+			return repository.ErrNotFound
+		}
+		return internalerrors.New(internalerrors.ErrDatabaseError, "delete admin session", err)
+	}
+	return nil
+}
+
+func (r *adminSessionRepository) DeleteExpired(ctx context.Context, now time.Time) (int64, error) {
+	if now.IsZero() {
+		return 0, internalerrors.New(internalerrors.ErrValidationFailed, "now is required", nil)
+	}
+	tag, err := r.pool.Exec(ctx, `DELETE FROM admin_sessions WHERE expires_at <= $1`, now.UTC())
+	if err != nil {
+		return 0, internalerrors.New(internalerrors.ErrDatabaseError, "delete expired admin sessions", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+type passwordResetTokenRepository struct {
+	pool *pgxpool.Pool
+}
+
+func (r *passwordResetTokenRepository) Create(ctx context.Context, token models.PasswordResetToken) error {
+	if err := token.Validate(); err != nil {
+		return internalerrors.New(internalerrors.ErrValidationFailed, "validate password reset token", err)
+	}
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO password_reset_tokens (id, admin_user_id, token_hash, created_at, expires_at, used_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+		token.ID,
+		token.AdminUserID,
+		token.TokenHash,
+		token.CreatedAt.UTC(),
+		token.ExpiresAt.UTC(),
+		token.UsedAt,
+	)
+	if err != nil {
+		return internalerrors.New(internalerrors.ErrDatabaseError, "insert password reset token", err)
+	}
+	return nil
+}
+
+func (r *passwordResetTokenRepository) GetByTokenHash(ctx context.Context, tokenHash string) (models.PasswordResetToken, error) {
+	tokenHash = strings.TrimSpace(tokenHash)
+	if tokenHash == "" {
+		return models.PasswordResetToken{}, internalerrors.New(internalerrors.ErrValidationFailed, "tokenHash is required", nil)
+	}
+	var out models.PasswordResetToken
+	row := r.pool.QueryRow(ctx,
+		`SELECT id, admin_user_id, token_hash, created_at, expires_at, used_at FROM password_reset_tokens WHERE token_hash = $1`,
+		tokenHash,
+	)
+	if err := row.Scan(&out.ID, &out.AdminUserID, &out.TokenHash, &out.CreatedAt, &out.ExpiresAt, &out.UsedAt); err != nil {
+		if err == pgx.ErrNoRows {
+			return models.PasswordResetToken{}, repository.ErrNotFound
+		}
+		return models.PasswordResetToken{}, internalerrors.New(internalerrors.ErrDatabaseError, "select password reset token", err)
+	}
+	return out, nil
+}
+
+func (r *passwordResetTokenRepository) MarkUsed(ctx context.Context, id string, usedAt time.Time) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return internalerrors.New(internalerrors.ErrValidationFailed, "id is required", nil)
+	}
+	if usedAt.IsZero() {
+		return internalerrors.New(internalerrors.ErrValidationFailed, "usedAt is required", nil)
+	}
+
+	var returnedID string
+	row := r.pool.QueryRow(ctx,
+		`UPDATE password_reset_tokens SET used_at = $2 WHERE id = $1 AND used_at IS NULL RETURNING id`,
+		id,
+		usedAt.UTC(),
+	)
+	if err := row.Scan(&returnedID); err != nil {
+		if err == pgx.ErrNoRows {
+			return repository.ErrNotFound
+		}
+		return internalerrors.New(internalerrors.ErrDatabaseError, "mark password reset token used", err)
+	}
+	return nil
+}
+
+func (r *passwordResetTokenRepository) DeleteExpired(ctx context.Context, now time.Time) (int64, error) {
+	if now.IsZero() {
+		return 0, internalerrors.New(internalerrors.ErrValidationFailed, "now is required", nil)
+	}
+	tag, err := r.pool.Exec(ctx, `DELETE FROM password_reset_tokens WHERE expires_at <= $1`, now.UTC())
+	if err != nil {
+		return 0, internalerrors.New(internalerrors.ErrDatabaseError, "delete expired password reset tokens", err)
 	}
 	return tag.RowsAffected(), nil
 }

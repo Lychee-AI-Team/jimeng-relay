@@ -18,11 +18,14 @@ import (
 type Repositories struct {
 	DB *sql.DB
 
-	APIKeys            *APIKeyRepo
-	DownstreamRequests *DownstreamRequestRepo
-	UpstreamAttempts   *UpstreamAttemptRepo
-	AuditEvents        *AuditEventRepo
-	IdempotencyRecords *IdempotencyRecordRepo
+	APIKeys             *APIKeyRepo
+	DownstreamRequests  *DownstreamRequestRepo
+	UpstreamAttempts    *UpstreamAttemptRepo
+	AuditEvents         *AuditEventRepo
+	IdempotencyRecords  *IdempotencyRecordRepo
+	AdminUsers          *AdminUserRepo
+	AdminSessions       *AdminSessionRepo
+	PasswordResetTokens *PasswordResetTokenRepo
 }
 
 func Open(ctx context.Context, dsn string) (*Repositories, error) {
@@ -63,6 +66,9 @@ func New(db *sql.DB) *Repositories {
 	r.UpstreamAttempts = &UpstreamAttemptRepo{db: db}
 	r.AuditEvents = &AuditEventRepo{db: db}
 	r.IdempotencyRecords = &IdempotencyRecordRepo{db: db}
+	r.AdminUsers = &AdminUserRepo{db: db}
+	r.AdminSessions = &AdminSessionRepo{db: db}
+	r.PasswordResetTokens = &PasswordResetTokenRepo{db: db}
 	return r
 }
 
@@ -107,7 +113,7 @@ func (r *APIKeyRepo) Create(ctx context.Context, key models.APIKey) error {
 
 func (r *APIKeyRepo) GetByAccessKey(ctx context.Context, accessKey string) (models.APIKey, error) {
 	return r.getOne(ctx,
-		`SELECT id, access_key, secret_key_hash, secret_key_ciphertext, description, created_at, updated_at, expires_at, revoked_at, rotation_of, status
+		`SELECT id, access_key, secret_key_hash, secret_key_ciphertext, description, multiplier, created_at, updated_at, expires_at, revoked_at, rotation_of, status
 		 FROM api_keys
 		 WHERE access_key = ?
 		 LIMIT 1;`,
@@ -117,7 +123,7 @@ func (r *APIKeyRepo) GetByAccessKey(ctx context.Context, accessKey string) (mode
 
 func (r *APIKeyRepo) GetByID(ctx context.Context, id string) (models.APIKey, error) {
 	return r.getOne(ctx,
-		`SELECT id, access_key, secret_key_hash, secret_key_ciphertext, description, created_at, updated_at, expires_at, revoked_at, rotation_of, status
+		`SELECT id, access_key, secret_key_hash, secret_key_ciphertext, description, multiplier, created_at, updated_at, expires_at, revoked_at, rotation_of, status
 		 FROM api_keys
 		 WHERE id = ?
 		 LIMIT 1;`,
@@ -142,6 +148,7 @@ func (r *APIKeyRepo) getOne(ctx context.Context, query string, arg any) (models.
 		&out.SecretKeyHash,
 		&out.SecretKeyCiphertext,
 		&description,
+		&out.Multiplier,
 		&createdAt,
 		&updatedAt,
 		&expiresAt,
@@ -174,7 +181,7 @@ func (r *APIKeyRepo) getOne(ctx context.Context, query string, arg any) (models.
 
 func (r *APIKeyRepo) List(ctx context.Context) ([]models.APIKey, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, access_key, secret_key_hash, secret_key_ciphertext, description, created_at, updated_at, expires_at, revoked_at, rotation_of, status
+		`SELECT id, access_key, secret_key_hash, secret_key_ciphertext, description, multiplier, created_at, updated_at, expires_at, revoked_at, rotation_of, status
 		 FROM api_keys
 		 ORDER BY created_at DESC;`,
 	)
@@ -200,6 +207,7 @@ func (r *APIKeyRepo) List(ctx context.Context) ([]models.APIKey, error) {
 			&k.SecretKeyHash,
 			&k.SecretKeyCiphertext,
 			&description,
+			&k.Multiplier,
 			&createdAt,
 			&updatedAt,
 			&expiresAt,
@@ -711,6 +719,222 @@ func (r *IdempotencyRecordRepo) Create(ctx context.Context, record models.Idempo
 
 func (r *IdempotencyRecordRepo) DeleteExpired(ctx context.Context, now time.Time) (int64, error) {
 	res, err := r.db.ExecContext(ctx, `DELETE FROM idempotency_records WHERE expires_at <= ?;`, formatTime(now))
+	if err != nil {
+		return 0, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return rows, nil
+}
+
+type AdminUserRepo struct{ db *sql.DB }
+
+var _ repository.AdminUserRepository = (*AdminUserRepo)(nil)
+
+func (r *AdminUserRepo) Create(ctx context.Context, user models.AdminUser) error {
+	if err := user.Validate(); err != nil {
+		return err
+	}
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO admin_users (id, email, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?);`,
+		user.ID,
+		user.Email,
+		user.PasswordHash,
+		formatTime(user.CreatedAt),
+		formatTime(user.UpdatedAt),
+	)
+	return err
+}
+
+func (r *AdminUserRepo) GetByID(ctx context.Context, id string) (models.AdminUser, error) {
+	return r.getOne(ctx, `SELECT id, email, password_hash, created_at, updated_at FROM admin_users WHERE id = ? LIMIT 1;`, id)
+}
+
+func (r *AdminUserRepo) GetByEmail(ctx context.Context, email string) (models.AdminUser, error) {
+	return r.getOne(ctx, `SELECT id, email, password_hash, created_at, updated_at FROM admin_users WHERE email = ? LIMIT 1;`, email)
+}
+
+func (r *AdminUserRepo) Update(ctx context.Context, user models.AdminUser) error {
+	if err := user.Validate(); err != nil {
+		return err
+	}
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE admin_users SET email = ?, password_hash = ?, updated_at = ? WHERE id = ?;`,
+		user.Email,
+		user.PasswordHash,
+		formatTime(user.UpdatedAt),
+		user.ID,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return repository.ErrNotFound
+	}
+	return nil
+}
+
+func (r *AdminUserRepo) getOne(ctx context.Context, query string, arg any) (models.AdminUser, error) {
+	var out models.AdminUser
+	var createdAt string
+	var updatedAt string
+	if err := r.db.QueryRowContext(ctx, query, arg).Scan(&out.ID, &out.Email, &out.PasswordHash, &createdAt, &updatedAt); err != nil {
+		return models.AdminUser{}, mapNotFound(err)
+	}
+	parsedCreatedAt, err := parseTime(createdAt)
+	if err != nil {
+		return models.AdminUser{}, err
+	}
+	parsedUpdatedAt, err := parseTime(updatedAt)
+	if err != nil {
+		return models.AdminUser{}, err
+	}
+	out.CreatedAt = parsedCreatedAt
+	out.UpdatedAt = parsedUpdatedAt
+	return out, nil
+}
+
+type AdminSessionRepo struct{ db *sql.DB }
+
+var _ repository.AdminSessionRepository = (*AdminSessionRepo)(nil)
+
+func (r *AdminSessionRepo) Create(ctx context.Context, session models.AdminSession) error {
+	if err := session.Validate(); err != nil {
+		return err
+	}
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO admin_sessions (id, admin_user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?);`,
+		session.ID,
+		session.AdminUserID,
+		session.TokenHash,
+		formatTime(session.CreatedAt),
+		formatTime(session.ExpiresAt),
+	)
+	return err
+}
+
+func (r *AdminSessionRepo) GetByTokenHash(ctx context.Context, tokenHash string) (models.AdminSession, error) {
+	var out models.AdminSession
+	var createdAt string
+	var expiresAt string
+	if err := r.db.QueryRowContext(ctx, `SELECT id, admin_user_id, token_hash, created_at, expires_at FROM admin_sessions WHERE token_hash = ? LIMIT 1;`, tokenHash).
+		Scan(&out.ID, &out.AdminUserID, &out.TokenHash, &createdAt, &expiresAt); err != nil {
+		return models.AdminSession{}, mapNotFound(err)
+	}
+	parsedCreatedAt, err := parseTime(createdAt)
+	if err != nil {
+		return models.AdminSession{}, err
+	}
+	parsedExpiresAt, err := parseTime(expiresAt)
+	if err != nil {
+		return models.AdminSession{}, err
+	}
+	out.CreatedAt = parsedCreatedAt
+	out.ExpiresAt = parsedExpiresAt
+	return out, nil
+}
+
+func (r *AdminSessionRepo) Delete(ctx context.Context, id string) error {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM admin_sessions WHERE id = ?;`, id)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return repository.ErrNotFound
+	}
+	return nil
+}
+
+func (r *AdminSessionRepo) DeleteExpired(ctx context.Context, now time.Time) (int64, error) {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM admin_sessions WHERE expires_at <= ?;`, formatTime(now))
+	if err != nil {
+		return 0, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return rows, nil
+}
+
+type PasswordResetTokenRepo struct{ db *sql.DB }
+
+var _ repository.PasswordResetTokenRepository = (*PasswordResetTokenRepo)(nil)
+
+func (r *PasswordResetTokenRepo) Create(ctx context.Context, token models.PasswordResetToken) error {
+	if err := token.Validate(); err != nil {
+		return err
+	}
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO password_reset_tokens (id, admin_user_id, token_hash, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, ?, ?);`,
+		token.ID,
+		token.AdminUserID,
+		token.TokenHash,
+		formatTime(token.CreatedAt),
+		formatTime(token.ExpiresAt),
+		nullableTime(token.UsedAt),
+	)
+	return err
+}
+
+func (r *PasswordResetTokenRepo) GetByTokenHash(ctx context.Context, tokenHash string) (models.PasswordResetToken, error) {
+	var out models.PasswordResetToken
+	var createdAt string
+	var expiresAt string
+	var usedAt sql.NullString
+
+	if err := r.db.QueryRowContext(ctx,
+		`SELECT id, admin_user_id, token_hash, created_at, expires_at, used_at FROM password_reset_tokens WHERE token_hash = ? LIMIT 1;`,
+		tokenHash,
+	).Scan(&out.ID, &out.AdminUserID, &out.TokenHash, &createdAt, &expiresAt, &usedAt); err != nil {
+		return models.PasswordResetToken{}, mapNotFound(err)
+	}
+
+	parsedCreatedAt, err := parseTime(createdAt)
+	if err != nil {
+		return models.PasswordResetToken{}, err
+	}
+	parsedExpiresAt, err := parseTime(expiresAt)
+	if err != nil {
+		return models.PasswordResetToken{}, err
+	}
+	out.CreatedAt = parsedCreatedAt
+	out.ExpiresAt = parsedExpiresAt
+	out.UsedAt = parseNullableTime(usedAt)
+	return out, nil
+}
+
+func (r *PasswordResetTokenRepo) MarkUsed(ctx context.Context, id string, usedAt time.Time) error {
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE password_reset_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL;`,
+		formatTime(usedAt),
+		id,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return repository.ErrNotFound
+	}
+	return nil
+}
+
+func (r *PasswordResetTokenRepo) DeleteExpired(ctx context.Context, now time.Time) (int64, error) {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM password_reset_tokens WHERE expires_at <= ?;`, formatTime(now))
 	if err != nil {
 		return 0, err
 	}

@@ -115,6 +115,13 @@ func TestServiceLifecycle_CreateListRevokeRotate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByID: %v", err)
 	}
+	if stored.Multiplier != 10000 {
+		t.Errorf("expected default multiplier 10000, got %d", stored.Multiplier)
+	}
+	if stored.SecretKeyHash == created.SecretKey {
+
+		t.Fatalf("GetByID: %v", err)
+	}
 	if stored.SecretKeyHash == created.SecretKey {
 		t.Fatalf("secret key must not be stored as plaintext")
 	}
