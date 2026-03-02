@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"github.com/jimeng-relay/server/internal/config"
-	relayhandler "github.com/jimeng-relay/server/internal/handler/relay"
+	adminhandler "github.com/jimeng-relay/server/internal/handler/admin"
 	"github.com/jimeng-relay/server/internal/handler/health"
+	relayhandler "github.com/jimeng-relay/server/internal/handler/relay"
 	"github.com/jimeng-relay/server/internal/logging"
+	adminmiddleware "github.com/jimeng-relay/server/internal/middleware/admin"
 	"github.com/jimeng-relay/server/internal/middleware/observability"
 	"github.com/jimeng-relay/server/internal/middleware/sigv4"
 	"github.com/jimeng-relay/server/internal/relay/upstream"
@@ -26,6 +28,7 @@ import (
 	"github.com/jimeng-relay/server/internal/repository/postgres"
 	"github.com/jimeng-relay/server/internal/repository/sqlite"
 	"github.com/jimeng-relay/server/internal/secretcrypto"
+	adminservice "github.com/jimeng-relay/server/internal/service/admin"
 	apikeyservice "github.com/jimeng-relay/server/internal/service/apikey"
 	auditservice "github.com/jimeng-relay/server/internal/service/audit"
 	idempotencyservice "github.com/jimeng-relay/server/internal/service/idempotency"
@@ -91,6 +94,9 @@ func runServer() error {
 
 	auditSvc := auditservice.NewService(repos.DownstreamRequests, repos.UpstreamAttempts, repos.AuditEvents, auditservice.Config{})
 	idempotencySvc := idempotencyservice.NewService(repos.IdempotencyRecords, idempotencyservice.Config{})
+	adminSvc := adminservice.NewService(repos.AdminUsers, repos.AdminSessions, adminservice.Config{})
+	emailCfg := config.LoadEmailConfigFromEnv()
+	emailProvider := adminservice.NewEmailProvider(emailCfg, logger)
 	keyManager := keymanager.NewService(logger)
 	upstreamClient, err := upstream.NewClient(cfg, upstream.Options{KeyManager: keyManager})
 	if err != nil {
@@ -98,8 +104,11 @@ func runServer() error {
 	}
 	authn := sigv4.New(repos.APIKeys, sigv4.Config{SecretCipher: secretCipher, ExpectedRegion: cfg.Region, ExpectedService: "cv"})
 	app := http.NewServeMux()
-	submitRoutes := relayhandler.NewSubmitHandler(upstreamClient, auditSvc, idempotencySvc, repos.IdempotencyRecords, logger).Routes()
-	getResultRoutes := relayhandler.NewGetResultHandler(upstreamClient, auditSvc, logger).Routes()
+	submitRoutes := relayhandler.NewSubmitHandler(upstreamClient, auditSvc, nil, idempotencySvc, repos.IdempotencyRecords, logger).Routes()
+	getResultRoutes := relayhandler.NewGetResultHandler(upstreamClient, auditSvc, nil, logger).Routes()
+	adminBootstrapRoutes := adminhandler.NewBootstrapHandler(adminSvc, logger).Routes()
+	adminResetRoutes := adminhandler.NewResetHandler(repos.AdminUsers, repos.PasswordResetTokens, emailProvider, logger, adminhandler.ResetHandlerConfig{ResetBaseURL: emailCfg.AdminResetBaseURL}).Routes()
+	adminAuthHandler := adminhandler.NewAuthHandler(repos.AdminUsers, repos.AdminSessions, adminhandler.AuthConfig{})
 	app.Handle("/v1/submit", submitRoutes)
 	app.Handle("/v1/get-result", getResultRoutes)
 	app.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -122,6 +131,21 @@ func runServer() error {
 	mux.HandleFunc("/health", healthHandler.Health)
 	mux.HandleFunc("/ready", healthHandler.Ready)
 
+	adminRoutes := http.NewServeMux()
+	adminRoutes.HandleFunc("/admin/login", adminAuthHandler.Login)
+	adminRoutes.HandleFunc("/admin/logout", adminAuthHandler.Logout)
+	adminRoutes.Handle("/admin/bootstrap", adminBootstrapRoutes)
+	adminRoutes.Handle("/admin/reset-request", adminResetRoutes)
+	adminRoutes.Handle("/admin/reset", adminResetRoutes)
+	adminRoutes.HandleFunc("/admin/keys", adminhandler.CreateKey)
+	adminRoutes.HandleFunc("/admin/pricing", adminhandler.UpsertPricing)
+	adminRoutes.HandleFunc("/admin/budget", adminhandler.SetBudget)
+	adminRoutes.HandleFunc("/admin/multiplier", adminhandler.SetMultiplier)
+	adminAuthn := adminmiddleware.New(repos.AdminSessions, repos.AdminUsers, adminmiddleware.Config{CookieName: "admin_session"})
+	adminChain := observability.RecoverMiddleware(logger)(obs(adminAuthn(adminRoutes)))
+	mux.Handle("/admin/", adminChain)
+	mux.Handle("/admin", adminChain)
+
 	mux.Handle("/", observability.RecoverMiddleware(logger)(obs(authn(app))))
 
 	log.Printf("Starting jimeng-relay server on port %s...", cfg.ServerPort)
@@ -130,6 +154,8 @@ func runServer() error {
 	log.Printf("API key lifecycle is managed via CLI: ./jimeng-server key ...")
 	log.Printf("Registered relay submit routes: POST /v1/submit, POST /?Action=CVSync2AsyncSubmitTask")
 	log.Printf("Registered relay get-result routes: POST /v1/get-result, POST /?Action=CVSync2AsyncGetResult")
+	log.Printf("Registered admin route: POST /admin/bootstrap")
+	log.Printf("Registered admin routes: POST /admin/login, POST /admin/logout, POST /admin/reset-request, POST /admin/reset")
 	srv := &http.Server{
 		Addr:              ":" + cfg.ServerPort,
 		Handler:           mux,
@@ -147,11 +173,14 @@ func runServer() error {
 }
 
 type repositories struct {
-	APIKeys            repository.APIKeyRepository
-	DownstreamRequests repository.DownstreamRequestRepository
-	UpstreamAttempts   repository.UpstreamAttemptRepository
-	AuditEvents        repository.AuditEventRepository
-	IdempotencyRecords repository.IdempotencyRecordRepository
+	APIKeys             repository.APIKeyRepository
+	DownstreamRequests  repository.DownstreamRequestRepository
+	UpstreamAttempts    repository.UpstreamAttemptRepository
+	AuditEvents         repository.AuditEventRepository
+	IdempotencyRecords  repository.IdempotencyRecordRepository
+	AdminUsers          repository.AdminUserRepository
+	AdminSessions       repository.AdminSessionRepository
+	PasswordResetTokens repository.PasswordResetTokenRepository
 }
 
 func openRepositories(ctx context.Context, cfg config.Config) (repositories, func(), error) {
@@ -163,13 +192,13 @@ func openRepositories(ctx context.Context, cfg config.Config) (repositories, fun
 			return repositories{}, nil, fmt.Errorf("open sqlite repository: %w", err)
 		}
 		cleanup := func() { _ = repos.Close() }
-		return repositories{APIKeys: repos.APIKeys, DownstreamRequests: repos.DownstreamRequests, UpstreamAttempts: repos.UpstreamAttempts, AuditEvents: repos.AuditEvents, IdempotencyRecords: repos.IdempotencyRecords}, cleanup, nil
+		return repositories{APIKeys: repos.APIKeys, DownstreamRequests: repos.DownstreamRequests, UpstreamAttempts: repos.UpstreamAttempts, AuditEvents: repos.AuditEvents, IdempotencyRecords: repos.IdempotencyRecords, AdminUsers: repos.AdminUsers, AdminSessions: repos.AdminSessions, PasswordResetTokens: repos.PasswordResetTokens}, cleanup, nil
 	case "postgres", "postgresql":
 		db, err := postgres.Open(ctx, cfg.DatabaseURL)
 		if err != nil {
 			return repositories{}, nil, fmt.Errorf("open postgres repository: %w", err)
 		}
-		return repositories{APIKeys: db.APIKeys(), DownstreamRequests: db.DownstreamRequests(), UpstreamAttempts: db.UpstreamAttempts(), AuditEvents: db.AuditEvents(), IdempotencyRecords: db.IdempotencyRecords()}, db.Close, nil
+		return repositories{APIKeys: db.APIKeys(), DownstreamRequests: db.DownstreamRequests(), UpstreamAttempts: db.UpstreamAttempts(), AuditEvents: db.AuditEvents(), IdempotencyRecords: db.IdempotencyRecords(), AdminUsers: db.AdminUsers(), AdminSessions: db.AdminSessions(), PasswordResetTokens: db.PasswordResetTokens()}, db.Close, nil
 	default:
 		return repositories{}, nil, fmt.Errorf("unsupported database_type: %s", cfg.DatabaseType)
 	}

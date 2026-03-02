@@ -13,6 +13,7 @@ import (
 	"github.com/jimeng-relay/server/internal/models"
 	"github.com/jimeng-relay/server/internal/relay/upstream"
 	auditservice "github.com/jimeng-relay/server/internal/service/audit"
+	billingservice "github.com/jimeng-relay/server/internal/service/billing"
 )
 
 const getResultAction = "CVSync2AsyncGetResult"
@@ -21,17 +22,26 @@ type getResultClient interface {
 	GetResult(ctx context.Context, body []byte, headers http.Header) (*upstream.Response, error)
 }
 
-type GetResultHandler struct {
-	client getResultClient
-	audit  *auditservice.Service
-	logger *slog.Logger
+type getResultBillingService interface {
+	Settle(ctx context.Context, requestID, apiKeyID string) error
+	Release(ctx context.Context, requestID, apiKeyID string) error
 }
 
-func NewGetResultHandler(client getResultClient, auditSvc *auditservice.Service, logger *slog.Logger) *GetResultHandler {
+type GetResultHandler struct {
+	client  getResultClient
+	audit   *auditservice.Service
+	billing getResultBillingService
+	logger  *slog.Logger
+}
+
+func NewGetResultHandler(client getResultClient, auditSvc *auditservice.Service, billingSvc getResultBillingService, logger *slog.Logger) *GetResultHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &GetResultHandler{client: client, audit: auditSvc, logger: logger}
+	if billingSvc == nil {
+		billingSvc = billingservice.NewService(billingservice.Config{})
+	}
+	return &GetResultHandler{client: client, audit: auditSvc, billing: billingSvc, logger: logger}
 }
 
 func (h *GetResultHandler) Routes() http.Handler {
@@ -76,6 +86,11 @@ func (h *GetResultHandler) proxyGetResult(w http.ResponseWriter, r *http.Request
 	}
 	if h.audit == nil {
 		finalErr = internalerrors.New(internalerrors.ErrInternalError, "audit service is not configured", nil)
+		writeRelayError(w, finalErr, http.StatusInternalServerError)
+		return
+	}
+	if h.billing == nil {
+		finalErr = internalerrors.New(internalerrors.ErrInternalError, "billing service is not configured", nil)
 		writeRelayError(w, finalErr, http.StatusInternalServerError)
 		return
 	}
@@ -141,7 +156,18 @@ func (h *GetResultHandler) proxyGetResult(w http.ResponseWriter, r *http.Request
 		call.Upstream.ResponseBody = nil
 		call.Upstream.LatencyMs = latencyMs
 		call.Upstream.Error = upstreamErr
+
+		taskStatus := parseGetResultTaskStatus(resp.Body)
+		call.Billing = auditservice.BillingTrace{ResultState: plannedBillingResultState(taskStatus, callErr)}
+		if call.Billing.ResultState == "settled" || call.Billing.ResultState == "released" {
+			call.Billing.SettlementID = reqID
+		}
 		if err := h.audit.RecordRelayUpstreamAndEvents(ctx, call); err != nil {
+			finalErr = err
+			writeRelayError(w, finalErr, http.StatusInternalServerError)
+			return
+		}
+		if err := h.handleResultBilling(ctx, reqID, apiKeyID, taskStatus, callErr); err != nil {
 			finalErr = err
 			writeRelayError(w, finalErr, http.StatusInternalServerError)
 			return
@@ -150,6 +176,11 @@ func (h *GetResultHandler) proxyGetResult(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if callErr != nil {
+		if err := h.billing.Release(ctx, reqID, apiKeyID); err != nil {
+			finalErr = err
+			writeRelayError(w, finalErr, http.StatusInternalServerError)
+			return
+		}
 		code := internalerrors.GetCode(callErr)
 		if code != "" && code != internalerrors.ErrUnknown && code != internalerrors.ErrUpstreamFailed {
 			finalErr = callErr
@@ -161,6 +192,62 @@ func (h *GetResultHandler) proxyGetResult(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if err := h.billing.Release(ctx, reqID, apiKeyID); err != nil {
+		finalErr = err
+		writeRelayError(w, finalErr, http.StatusInternalServerError)
+		return
+	}
 	finalErr = internalerrors.New(internalerrors.ErrUpstreamFailed, "get-result upstream returned empty response", nil)
 	writeRelayError(w, finalErr, http.StatusBadGateway)
+}
+
+func (h *GetResultHandler) handleResultBilling(ctx context.Context, requestID, apiKeyID, taskStatus string, callErr error) error {
+	if callErr != nil {
+		return h.billing.Release(ctx, requestID, apiKeyID)
+	}
+	switch {
+	case strings.EqualFold(taskStatus, "Done"):
+		return h.billing.Settle(ctx, requestID, apiKeyID)
+	case strings.EqualFold(taskStatus, "Failed"):
+		return h.billing.Release(ctx, requestID, apiKeyID)
+	default:
+		return nil
+	}
+}
+
+func plannedBillingResultState(taskStatus string, callErr error) string {
+	if callErr != nil {
+		return "released"
+	}
+	switch {
+	case strings.EqualFold(taskStatus, "Done"):
+		return "settled"
+	case strings.EqualFold(taskStatus, "Failed"):
+		return "released"
+	default:
+		return "pending"
+	}
+}
+
+func parseGetResultTaskStatus(body []byte) string {
+	payload := decodeJSONMap(body)
+	if payload == nil {
+		return ""
+	}
+	if v := taskStatusFromMap(payload); v != "" {
+		return v
+	}
+	data, ok := payload["data"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	return taskStatusFromMap(data)
+}
+
+func taskStatusFromMap(m map[string]any) string {
+	v, ok := m["task_status"].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(v)
 }

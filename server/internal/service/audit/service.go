@@ -57,8 +57,37 @@ type RelayCall struct {
 	DownstreamBody    map[string]any
 	ClientIP          string
 
+	Billing BillingTrace
+
 	Upstream UpstreamAttempt
 	Events   []Event
+}
+
+type BillingTrace struct {
+	ComputedCredit string
+	PreAuthID      string
+	SettlementID   string
+	ResultState    string
+}
+
+func (t BillingTrace) metadata() map[string]any {
+	out := map[string]any{}
+	if strings.TrimSpace(t.ComputedCredit) != "" {
+		out[models.AuditMetaComputedCredit] = strings.TrimSpace(t.ComputedCredit)
+	}
+	if strings.TrimSpace(t.PreAuthID) != "" {
+		out[models.AuditMetaPreAuthID] = strings.TrimSpace(t.PreAuthID)
+	}
+	if strings.TrimSpace(t.SettlementID) != "" {
+		out[models.AuditMetaSettlementID] = strings.TrimSpace(t.SettlementID)
+	}
+	if strings.TrimSpace(t.ResultState) != "" {
+		out[models.AuditMetaResultState] = strings.TrimSpace(t.ResultState)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 type UpstreamAttempt struct {
@@ -210,6 +239,8 @@ func (s *Service) RecordRelayUpstreamAndEvents(ctx context.Context, call RelayCa
 		}
 	}
 
+	billingMeta := sanitizeMap(call.Billing.metadata())
+
 	for _, ev := range events {
 		id, err := generateID(s.random, "aevt_")
 		if err != nil {
@@ -219,6 +250,7 @@ func (s *Service) RecordRelayUpstreamAndEvents(ctx context.Context, call RelayCa
 		if actor == "" {
 			actor = "system"
 		}
+		meta := mergeMaps(sanitizeMap(ev.Metadata), billingMeta)
 		e := models.AuditEvent{
 			ID:        id,
 			RequestID: call.RequestID,
@@ -226,7 +258,7 @@ func (s *Service) RecordRelayUpstreamAndEvents(ctx context.Context, call RelayCa
 			Actor:     actor,
 			Action:    strings.TrimSpace(ev.Action),
 			Resource:  strings.TrimSpace(ev.Resource),
-			Metadata:  sanitizeMap(ev.Metadata),
+			Metadata:  meta,
 			CreatedAt: now,
 		}
 		if err := e.Validate(); err != nil {
@@ -247,6 +279,10 @@ func normalizeRelayCall(call *RelayCall) {
 	call.Path = strings.TrimSpace(call.Path)
 	call.Query = strings.TrimSpace(call.Query)
 	call.ClientIP = strings.TrimSpace(call.ClientIP)
+	call.Billing.ComputedCredit = strings.TrimSpace(call.Billing.ComputedCredit)
+	call.Billing.PreAuthID = strings.TrimSpace(call.Billing.PreAuthID)
+	call.Billing.SettlementID = strings.TrimSpace(call.Billing.SettlementID)
+	call.Billing.ResultState = strings.TrimSpace(call.Billing.ResultState)
 	call.Upstream.UpstreamAction = strings.TrimSpace(call.Upstream.UpstreamAction)
 }
 
@@ -298,6 +334,20 @@ func sanitizeAny(v any) any {
 	default:
 		return v
 	}
+}
+
+func mergeMaps(a, b map[string]any) map[string]any {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(a)+len(b))
+	for k, v := range a {
+		out[k] = v
+	}
+	for k, v := range b {
+		out[k] = v
+	}
+	return out
 }
 
 func shouldRedactKey(key string) bool {

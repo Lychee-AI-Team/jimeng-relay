@@ -17,6 +17,13 @@ const (
 	EventTypeError            EventType = "error"
 )
 
+const (
+	AuditMetaComputedCredit = "computed_credit"
+	AuditMetaPreAuthID      = "preauth_id"
+	AuditMetaSettlementID   = "settlement_id"
+	AuditMetaResultState    = "result_state"
+)
+
 type AuditEvent struct {
 	ID        string         `json:"id"`
 	RequestID string         `json:"request_id"`

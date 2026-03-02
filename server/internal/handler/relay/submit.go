@@ -14,6 +14,7 @@ import (
 	"github.com/jimeng-relay/server/internal/relay/upstream"
 	"github.com/jimeng-relay/server/internal/repository"
 	auditservice "github.com/jimeng-relay/server/internal/service/audit"
+	billingservice "github.com/jimeng-relay/server/internal/service/billing"
 	idempotencyservice "github.com/jimeng-relay/server/internal/service/idempotency"
 )
 
@@ -23,19 +24,34 @@ type submitClient interface {
 	Submit(ctx context.Context, body []byte, headers http.Header) (*upstream.Response, error)
 }
 
+type billingService interface {
+	PreAuthorize(ctx context.Context, requestID, apiKeyID string, requestBody []byte) (billingservice.PreAuthResult, error)
+}
+
 type SubmitHandler struct {
 	client      submitClient
 	audit       *auditservice.Service
+	billing     billingService
 	idempotency *idempotencyservice.Service
 	idemRepo    repository.IdempotencyRecordRepository
 	logger      *slog.Logger
 }
 
-func NewSubmitHandler(client submitClient, auditSvc *auditservice.Service, idempotencySvc *idempotencyservice.Service, idemRepo repository.IdempotencyRecordRepository, logger *slog.Logger) *SubmitHandler {
+func NewSubmitHandler(client submitClient, auditSvc *auditservice.Service, billingSvc billingService, idempotencySvc *idempotencyservice.Service, idemRepo repository.IdempotencyRecordRepository, logger *slog.Logger) *SubmitHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &SubmitHandler{client: client, audit: auditSvc, idempotency: idempotencySvc, idemRepo: idemRepo, logger: logger}
+	if billingSvc == nil {
+		billingSvc = billingservice.NewService(billingservice.Config{})
+	}
+	return &SubmitHandler{
+		client:      client,
+		audit:       auditSvc,
+		billing:     billingSvc,
+		idempotency: idempotencySvc,
+		idemRepo:    idemRepo,
+		logger:      logger,
+	}
 }
 
 func (h *SubmitHandler) Routes() http.Handler {
@@ -104,6 +120,12 @@ func (h *SubmitHandler) proxySubmit(w http.ResponseWriter, r *http.Request, appl
 		writeRelayError(w, finalErr, http.StatusRequestEntityTooLarge)
 		return
 	}
+	body, err = normalizeSubmitVideoFrames(body)
+	if err != nil {
+		finalErr = internalerrors.New(internalerrors.ErrValidationFailed, err.Error(), nil)
+		writeRelayError(w, finalErr, http.StatusBadRequest)
+		return
+	}
 
 	idempotencyKey := ""
 	requestHash := ""
@@ -139,6 +161,24 @@ func (h *SubmitHandler) proxySubmit(w http.ResponseWriter, r *http.Request, appl
 		}
 	}
 
+	if h.billing == nil {
+		finalErr = internalerrors.New(internalerrors.ErrInternalError, "billing service is not configured", nil)
+		writeRelayError(w, finalErr, http.StatusInternalServerError)
+		return
+	}
+	preAuth, err := h.billing.PreAuthorize(ctx, reqID, apiKeyID, body)
+	if err != nil {
+		if billingservice.IsInsufficientBudget(err) {
+			finalErr = err
+			writeRelayError(w, finalErr, http.StatusPaymentRequired)
+			return
+		}
+		finalErr = err
+		writeRelayError(w, finalErr, 0)
+		return
+	}
+	ctx = billingservice.WithPreAuthResult(ctx, preAuth)
+
 	headers := pickForwardHeaders(r.Header)
 	call := auditservice.RelayCall{
 		RequestID:         reqID,
@@ -150,6 +190,11 @@ func (h *SubmitHandler) proxySubmit(w http.ResponseWriter, r *http.Request, appl
 		ClientIP:          strings.TrimSpace(r.RemoteAddr),
 		DownstreamHeaders: headerToMapAny(r.Header),
 		DownstreamBody:    decodeJSONMap(body),
+		Billing: auditservice.BillingTrace{
+			ComputedCredit: preAuth.EstimatedCost.String(),
+			PreAuthID:      preAuth.LedgerID,
+			ResultState:    "preauth",
+		},
 		Upstream: auditservice.UpstreamAttempt{
 			AttemptNumber:  1,
 			UpstreamAction: submitAction,
