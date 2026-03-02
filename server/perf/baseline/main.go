@@ -247,7 +247,7 @@ func setupBench(timeout time.Duration, maxRetries, clientMaxIdle int, upstreamDe
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	authn := sigv4.New(repos.APIKeys, sigv4.Config{SecretCipher: secretCipher, ExpectedRegion: "cn-north-1", ExpectedService: "cv"})
-	submitRoutes := relayhandler.NewSubmitHandler(upstreamClient, auditSvc, idemSvc, repos.IdempotencyRecords, logger).Routes()
+	submitRoutes := relayhandler.NewSubmitHandler(upstreamClient, auditSvc, nil, idemSvc, repos.IdempotencyRecords, logger).Routes()
 
 	app := http.NewServeMux()
 	app.Handle("/v1/submit", submitRoutes)
